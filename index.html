@@ -2151,9 +2151,12 @@ url:e,reason:"blocked_domain_not_allowlisted"},b.parentOrigin);throw new DOMExce
     }
 
     function showTab(tabName) {
-      document.querySelectorAll('.tab-content').forEach(el => el.classList.add('hidden'));
-      document.getElementById(`tab-${tabName}`).classList.remove('hidden');
-    }
+  document.querySelectorAll('.tab-content').forEach(el => {
+    const isTarget = el.id === `tab-${tabName}`;
+    el.classList.toggle('hidden', !isTarget);
+    el.style.display = isTarget ? 'block' : 'none';
+  });
+}
 
     function openAdminAuth() {
       document.getElementById('auth-modal').classList.remove('hidden');
