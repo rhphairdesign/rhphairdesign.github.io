@@ -850,7 +850,7 @@
         <!-- 予約の受付ルール -->
         <div class="bg-white rounded-3xl p-5 shadow-sm border">
           <h3 class="font-bold text-gray-800 mb-3 flex items-center gap-2">
-            <i class="fa-solid fa-sliders text-amber-600"></i> 予約の受付ルール <span class="text-[10px] font-normal text-gray-400">（版 11/23-e）</span>
+            <i class="fa-solid fa-sliders text-amber-600"></i> 予約の受付ルール <span class="text-[10px] font-normal text-gray-400">（版 11/25-f）</span>
           </h3>
           <form onsubmit="saveBookingSettings(event)" class="space-y-3 text-xs">
             <div>
@@ -1393,6 +1393,13 @@
   </div>
 
   <script>
+    const MAIL_URL = 'https://script.google.com/macros/s/AKfycbyrf2pKqXyXSygTZx8OPMVlfNwxeWdACX4FVGMIGpsvewfr71fJCCgTypvajhjDIsjCDA/exec';
+    function sendMail(type, code) {
+      if (!MAIL_URL) return;
+      try {
+        fetch(MAIL_URL, { method: 'POST', mode: 'no-cors', keepalive: true, headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: JSON.stringify({ type, code }) }).catch(() => {});
+      } catch (e) { /* メールが送れなくても予約はそのまま */ }
+    }
     const cloud = window.cloud = {
       cache: {}, save: null,
       setSlots(m, b) { state.slots = m; state.blocks = b || {}; renderAdminCalendar(); },
@@ -1762,7 +1769,8 @@
         return;
       }
       keys.forEach(k => { state.slots[k] = rid; });
-      showToast('🎉 予約完了', `${name} 様、ご予約を承りました！\n予約コード: ${fmtCode(rid)}\n確認・キャンセルに必要です。画面を保存してください。`);
+      sendMail('booked', rid);
+      showToast('🎉 予約完了', `${name} 様、ご予約を承りました！\n予約コード: ${fmtCode(rid)}\n確認・キャンセルに必要です。画面を保存してください。${email ? '\n確認メールもお送りします（届かないときは迷惑メールもご確認ください）。' : ''}`);
       state.selectedMenuIds = [];
       document.getElementById('book-note').value = '';
       document.getElementById('booking-step4-container').classList.add('hidden');
@@ -2340,6 +2348,7 @@
         const ok = await cloud.cancel(code);
         if (!ok) { showToast('見つかりません', 'すでにキャンセル済みか、コードが違います。'); return; }
       } catch (err) { console.error(err); showToast('⚠️ 失敗', 'キャンセルできませんでした。通信状況をご確認ください。'); return; }
+      sendMail('cancelled', code);
       document.getElementById('cancel-booking-list').innerHTML = '';
       document.getElementById('cancel-result-container').classList.add('hidden');
       showToast('キャンセル完了', 'ご予約をキャンセルいたしました。');
