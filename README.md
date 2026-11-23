@@ -1,1 +1,3078 @@
-　
+<html lang="ja"><head>
+    <script>
+      (function() {
+        // Capture host references before any artifact code runs: Window.parent
+        // is [Replaceable] (a top-level `var parent` in artifact code would
+        // replace the accessor with a data property), and a top-level
+        // `const crypto` would shadow the global — either would otherwise
+        // silently break the bridge for artifacts that worked before.
+        const realParent = window.parent;
+        const downloadTarget = '/';
+        const cryptoObj = window.crypto;
+        const RealURL = URL;
+        const realDecodeURIComponent = decodeURIComponent;
+        const RealTextEncoder = TextEncoder;
+        const realAtob = atob;
+        const realHistory = window.history;
+        const RealHashChangeEvent = window.HashChangeEvent;
+        const realDispatchEvent = window.dispatchEvent.bind(window);
+        // html-to-image is only used by takeScreenshot: fetched on first use, not as a
+        // parser-blocking tag. Native fetch, captured before the proxy override below.
+        const realFetch = typeof window.fetch === 'function' ? window.fetch.bind(window) : null;
+        const HTML_TO_IMAGE_SRC = "https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js";
+        const HTML_TO_IMAGE_INTEGRITY = "sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==";
+        let htmlToImageLoad = null;
+        const loadHtmlToImage = () => {
+          if (!htmlToImageLoad) {
+            htmlToImageLoad = (realFetch
+              ? realFetch(HTML_TO_IMAGE_SRC, { integrity: HTML_TO_IMAGE_INTEGRITY, credentials: 'omit', referrerPolicy: 'no-referrer' })
+              : Promise.reject(new Error('fetch unavailable'))
+            )
+              .then((res) => {
+                if (!res.ok) throw new Error('html-to-image failed to load (' + res.status + ')');
+                return res.text();
+              })
+              .then((source) => {
+                // UMD bundle: hide the artifact's AMD/CommonJS globals so it takes the
+                // window-global branch; inline script text runs synchronously on insert.
+                const hidden = ['define', 'module', 'exports'].map((k) => {
+                  const entry = { k, own: Object.prototype.hasOwnProperty.call(window, k), v: window[k] };
+                  try { window[k] = undefined; } catch (e) {}
+                  return entry;
+                });
+                try {
+                  const el = document.createElement('script');
+                  el.text = source;
+                  (document.head || document.documentElement).appendChild(el);
+                } finally {
+                  hidden.forEach(({ k, own, v }) => {
+                    try { if (own) { window[k] = v; } else { delete window[k]; } } catch (e) {}
+                  });
+                }
+                if (!window.htmlToImage) throw new Error('html-to-image unavailable after load');
+                return window.htmlToImage;
+              });
+            // A failed load may be transient; let the next screenshot retry.
+            htmlToImageLoad.catch(() => { htmlToImageLoad = null; });
+          }
+          return htmlToImageLoad;
+        };
+        // crypto.randomUUID exists only in Secure Contexts; fall back to a
+        // unique non-crypto id elsewhere (http://LAN-IP dev flows) —
+        // uniqueness is what the bridge needs, unpredictability is
+        // defense-in-depth on top of the source guards.
+        const newRequestId =
+          cryptoObj && typeof cryptoObj.randomUUID === "function"
+            ? function () { return cryptoObj.randomUUID(); }
+            : function () { return Date.now() + "-" + Math.random(); };
+
+        // Bridge request ids are crypto-random (not sequential) so they
+        // cannot be predicted by other frames in the tab.
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        // storage.get and .list calls not yet answered, read by the parent at this frame's 'load' (an answer may restyle the page); counted
+        // here, not there, because WebKit can run this frame's 'load' in the parent before a message posted while parsing has arrived.
+        let storageReadsOut = 0;
+        try { Object.defineProperty(window, '__storageReadsOut', { configurable: true, get: () => storageReadsOut }); } catch (e) {}
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+              storageReadsOut += 1;
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+              storageReadsOut += 1;
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = newRequestId();
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Null-body statuses: Response(stream, {status: 204}) throws
+                // per the Fetch spec, which would escape this resolver and
+                // hang the artifact's await forever.
+                if (response.status === 204 || response.status === 205 || response.status === 304) {
+                  try {
+                    resolve(new Response(null, {
+                      status: response.status,
+                      statusText: response.statusText,
+                      headers: response.headers
+                    }));
+                  } catch (err) {
+                    // Invalid statusText/header bytes can throw here too.
+                    reject(new TypeError(
+                      'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                    ));
+                  }
+                  return;
+                }
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream. Response()
+                // requires status in [200, 599]; an opaque/no-cors fetch
+                // forwards status 0, which would throw here and escape the
+                // resolver, hanging the artifact's await. Surface it as a
+                // network-error-shaped rejection instead.
+                try {
+                  resolve(new Response(stream, {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: response.headers
+                  }));
+                } catch (err) {
+                  streamControllers.delete(channelId);
+                  reject(new TypeError(
+                    'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                  ));
+                }
+              },
+              reject,
+              channelId
+            });
+            
+            realParent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          // Only the embedding parent may drive the bridge — sibling and
+          // nested frames can also postMessage into this window.
+          if (event.source !== realParent) return;
+          if (event.data.type === 'takeScreenshot') {
+            // Echo the request's nonce so the requester can correlate the
+            // reply to ITS request — a reply without the expected nonce
+            // (e.g. from a stale pre-remount artifact) is ignored upstream.
+            const screenshotNonce = event.data.nonce;
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: new Error('Root element not found'),
+              }, '*');
+              return;
+            }
+            // Catch CDN load failures and toPng errors so the parent always
+            // gets a response instead of hanging forever.
+            try {
+              const htmlToImage = await loadHtmlToImage();
+              // Draws only the top, 630/1200 of the width tall, as the link preview is 1200x630. `height` also shortens html-to-image's copy of the root and
+              // what its % min- and max-height resolve against, which moves centred content; `style` undoes that. Keep in step with app/page.tsx.
+              const previewHeight = Math.ceil((rootElement.offsetWidth * 630) / 1200);
+              const screenshot = await htmlToImage.toPng(rootElement, {
+                ...(rootElement.offsetHeight > previewHeight && {
+                  height: previewHeight,
+                  style: { height: window.getComputedStyle(rootElement).height, minHeight: '0', maxHeight: 'none' },
+                }),
+                imagePlaceholder:
+                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+              });
+              realParent.postMessage({
+                type: 'screenshotData',
+                nonce: screenshotNonce,
+                data: screenshot,
+              }, '*');
+            } catch (err) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: err instanceof Error ? err : new Error(String(err)),
+              }, '*');
+            }
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            storageReadsOut -= 1;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            storageReadsOut -= 1;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        // An SVG <a> exposes href as an SVGAnimatedString; its baseVal is the attribute
+        // as written, so resolve it against the base URL as the browser does for an HTML <a>.
+        const resolvedHref = (linkEl) => {
+          if (typeof linkEl.href === "string") return linkEl.href;
+          const written = linkEl.href?.baseVal;
+          // A same-document SVG link, such as one that begins an animation, stays with the browser.
+          if (!written || written.trim().startsWith("#")) return "";
+          try {
+            return new RealURL(written, linkEl.baseURI).href;
+          } catch (error) {
+            return written;
+          }
+        };
+
+        // This frame's URL is about:srcdoc, so the browser resolves "#id" against the renderer
+        // page and would load that page in the frame instead of scrolling.
+        const sameDocumentFragment = (linkEl) => {
+          const written = linkEl.getAttribute("href")?.trim();
+          if (!written?.startsWith("#") || document.querySelector("base[href]")) return null;
+          return written.slice(1);
+        };
+
+        // Same as focusFragmentTarget in app/page.tsx; change both together.
+        const focusFragmentTarget = (target, focusVisible) => {
+          if (!document.hasFocus() || target === document.body) return;
+          target.focus({ preventScroll: true, focusVisible });
+          if (document.activeElement === target || target.hasAttribute("tabindex")) return;
+          const takeBack = () => {
+            if (document.activeElement === target) return;
+            target.removeAttribute("tabindex");
+            target.removeEventListener("blur", takeBack);
+          };
+          target.setAttribute("tabindex", "-1");
+          target.addEventListener("blur", takeBack);
+          target.focus({ preventScroll: true, focusVisible });
+          takeBack();
+        };
+
+        // Not location.replace: a navigation also scrolls and moves focus. replaceState fires no hashchange, so the page is told here.
+        const moveAddress = (fragment) => {
+          const oldURL = window.location.href;
+          const newURL = new RealURL("#" + fragment, oldURL).href;
+          if (newURL === oldURL) return;
+          try {
+            realHistory.replaceState(realHistory.state, "", newURL);
+          } catch (error) {
+            // Safari and Firefox throw when it is called too often.
+            return;
+          }
+          setTimeout(() => realDispatchEvent(new RealHashChangeEvent("hashchange", { oldURL, newURL })));
+        };
+
+        const scrollToFragment = (fragment, linkEl) => {
+          let decoded = fragment;
+          try {
+            decoded = realDecodeURIComponent(fragment);
+          } catch (error) {}
+          let target = document.getElementById(fragment) ?? document.getElementById(decoded);
+          for (const named of target ? [] : document.getElementsByName(decoded)) {
+            if (named.localName === "a") {
+              target = named;
+              break;
+            }
+          }
+          if (target) {
+            target.scrollIntoView();
+            focusFragmentTarget(target, linkEl.matches(":focus-visible"));
+          } else if (decoded.toLowerCase() === "top") {
+            window.scrollTo(0, 0);
+          } else {
+            return false;
+          }
+          return true;
+        };
+
+        // Same decoder as dataUrlFile in app/page.tsx; change both together.
+        const hexPair = /^[0-9a-f]{2}$/i;
+        const dataUrlFile = (href) => {
+          const hash = href.indexOf("#");
+          const url = hash === -1 ? href : href.slice(0, hash);
+          const comma = url.indexOf(",");
+          if (comma === -1) return null;
+          const header = url.slice(0, comma);
+          const payload = url.slice(comma + 1);
+          const mimeMatch = header.match(/data:([^;]+)/);
+          const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+          const declaredBase64 = header
+            .split(";")
+            .slice(1)
+            .some((param) => param.trim().toLowerCase() === "base64");
+          const type = mimeMatch ? mimeMatch[1].trim().toLowerCase() : "";
+          const binaryType = type !== "" && !type.startsWith("text/");
+          if (declaredBase64 || (binaryType && !payload.includes("%"))) {
+            let binary = null;
+            try {
+              binary = realAtob(
+                payload.replace(/%([0-9a-f]{2})/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16))),
+              );
+            } catch (error) {
+              if (declaredBase64) return null;
+            }
+            if (binary !== null) {
+              const bytes = new Uint8Array(binary.length);
+              for (let i = 0; i < binary.length; i++) {
+                bytes[i] = binary.charCodeAt(i);
+              }
+              return { mimeType, data: bytes.buffer };
+            }
+          }
+          const input = new RealTextEncoder().encode(payload);
+          const bytes = new Uint8Array(input.length);
+          let length = 0;
+          for (let i = 0; i < input.length; i++) {
+            if (input[i] === 0x25 && i + 2 < input.length) {
+              const pair = String.fromCharCode(input[i + 1], input[i + 2]);
+              if (hexPair.test(pair)) {
+                bytes[length++] = parseInt(pair, 16);
+                i += 2;
+                continue;
+              }
+            }
+            bytes[length++] = input[i];
+          }
+          return { mimeType, data: bytes.slice(0, length).buffer };
+        };
+
+        const onLinkClick = (event) => {
+          // Not instanceof Element: an artifact's own top-level class Element shadows the global.
+          if (typeof event.target?.closest !== "function") return;
+    
+          const linkEl = event.target.closest("a, area[href]");
+          const href = linkEl && resolvedHref(linkEl);
+          if (!href) return;
+
+          const fragment = sameDocumentFragment(linkEl);
+          if (fragment !== null) {
+            const handledByArtifact = event.defaultPrevented;
+            event.preventDefault();
+            if (handledByArtifact || fragment === "") return;
+            // Not for a script's click while the person is in the chat: the page may take the keyboard when its address changes.
+            if (false && (event.isTrusted || document.hasFocus())) moveAddress(fragment);
+            if (scrollToFragment(fragment, linkEl)) return;
+            // A fragment that names nothing in the artifact may name something in the host,
+            // such as a project thread. The artifact's own listeners still see the click.
+            realParent.postMessage({ type: 'openExternal', href }, '*');
+            return;
+          }
+          const filename = linkEl.getAttribute("download") ?? "";
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+          followLink(href, filename);
+        };
+
+        const followLink = (href, filename) => {
+          if (href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              realParent.postMessage({
+                type: "downloadFile",
+                filename,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              }, downloadTarget);
+            });
+          } else if (href.startsWith("data:")) {
+            const file = dataUrlFile(href);
+            if (!file) return;
+            realParent.postMessage({
+              type: "downloadFile",
+              filename,
+              data: file.data,
+              mimeType: file.mimeType,
+            }, downloadTarget);
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            realParent.postMessage({
+              type: 'openExternal',
+              href,
+            }, '*');
+          }
+        };
+        window.addEventListener('click', onLinkClick);
+
+        // HACK: a click on an <a download> that is not in the document, or a dispatched click that does not bubble, never reaches the window
+        // listener, so the link gets a listener of its own while its click() or dispatchEvent() runs, after the artifact's. Change with app/page.tsx.
+        const RealAnchor = window.HTMLAnchorElement;
+        const RealMouseEvent = window.MouseEvent;
+        const anchorProto = RealAnchor?.prototype;
+        const superProto = anchorProto && Object.getPrototypeOf(anchorProto);
+        if (typeof RealAnchor === 'function' && typeof RealMouseEvent === 'function' && typeof superProto?.click === 'function' && typeof superProto?.dispatchEvent === 'function') {
+          const onMissedClick = (event) => {
+            if (!event.defaultPrevented) onLinkClick(event);
+          };
+          // Links whose click() or dispatchEvent() is running, so a call made during it leaves the outer call's listener in place.
+          const listening = new WeakSet();
+          const callHearingMissed = (anchor, bubbles, call) => {
+            if (!(anchor instanceof RealAnchor) || !anchor.hasAttribute('download') || (anchor.isConnected && bubbles) || listening.has(anchor)) {
+              return call();
+            }
+            listening.add(anchor);
+            anchor.addEventListener('click', onMissedClick);
+            try {
+              return call();
+            } finally {
+              listening.delete(anchor);
+              anchor.removeEventListener('click', onMissedClick);
+            }
+          };
+          anchorProto.click = function () {
+            return callHearingMissed(this, true, () => superProto.click.call(this));
+          };
+          anchorProto.dispatchEvent = function (event) {
+            const call = () => superProto.dispatchEvent.call(this, event);
+            return event instanceof RealMouseEvent && event.type === 'click' ? callHearingMissed(this, event.bubbles, call) : call();
+          };
+        }
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          realParent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+        // Only for a page that still shows nothing a second later: one that draws usually works on after a refused sound or a failed side call.
+        // A frame hidden behind the code view has no height, so a full-window canvas there would read as empty.
+        window.addEventListener('unhandledrejection', (event) => setTimeout(() => {
+          if (event.defaultPrevented || document.readyState === 'loading' || !window.innerHeight) return;
+          for (const el of document.querySelectorAll('body *')) {
+            if (el.getBoundingClientRect().height > 0) return;
+          }
+          if (document.body?.innerText.trim()) return;
+          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + (event.reason?.message || event.reason) }, '*');
+        }, 1000));
+
+        try {
+          (() => {
+            const l=URL;function guardAgainstLeaving(t,d,g){const{navigation:n}=t;if(t===t.top||!(n instanceof t.EventTarget&&"currentEntry"in n))return()=>{};const{document:i,navigator:s}=t,o="userAgentData"in s,v=o?/^(about|blob):/:/^(?!https?:|data:)/,c=a=>{const{canIntercept:f,destination:u,downloadRequest:h}=a;if(a.defaultPrevented||!a.cancelable||f||h!==null||v.test(u.url)||(a.preventDefault(),!i.hasFocus()||!o&&i.activeElement?.matches(":read-write")))return;const e=new l(u.url),r=new l(i.baseURI);e.origin!==r.origin?s.userActivation?.isActive!==!1&&d(e.href):o&&e.hash&&e.pathname+e.search===r.pathname+r.search&&g?.(e.hash.slice(1))};return n.addEventListener("navigate",c),()=>n.removeEventListener("navigate",c)}
+            guardAgainstLeaving(window, (href) => followLink(href, ""), (fragment) => {
+              if (false) moveAddress(fragment);
+              scrollToFragment(fragment, document.activeElement ?? document.documentElement);
+            });
+          })();
+        } catch (e) {}
+
+        try {
+          (() => {
+            const m=1e3,b=Reflect.apply;function lacksWebgl(e,l=Object.getOwnPropertyDescriptor(e.HTMLCanvasElement.prototype,"getContext")?.value){if(typeof e.WebGLRenderingContext!="function")return!0;if(typeof l!="function")return!1;const u=e.document.createElement("canvas"),o=b(l,u,["webgl"])??b(l,u,["experimental-webgl"]);return o instanceof e.WebGLRenderingContext&&o.getExtension("WEBGL_lose_context")?.loseContext(),o===null}function watchWebgl(e,l){const u=e.setTimeout.bind(e),o=e.HTMLCanvasElement.prototype,i=Object.getOwnPropertyDescriptor(o,"getContext"),f=i?.value;if(!i||typeof f!="function")return()=>{};let s=!1,d=!1,p=!1,c=null;const g=new WeakSet,h=new WeakSet,C=t=>{const{width:n,height:r}=t.getBoundingClientRect();return t.isConnected&&t.ownerDocument===e.document&&n>0&&r>0},a=()=>{d||(d=p)},L=(t,n,r)=>{if(n!=="webgl"&&n!=="webgl2"&&n!=="experimental-webgl"){r&&h.add(t);return}if(r){c=!0;return}s||g.has(t)||(c??(c=!lacksWebgl(e,f)),!c&&(g.add(t),e.addEventListener("error",a),e.addEventListener("unhandledrejection",a),p=!0,u(()=>{p=!1},0),u(()=>{!s&&!h.has(t)&&(d||C(t))&&(s=!0,l())},1e3)))};return Object.defineProperty(o,"getContext",{...i,value:function(...n){const r=b(f,this,n);try{L(this,n[0],r!==null)}catch{}return r}}),()=>{s=!0,e.removeEventListener("error",a),e.removeEventListener("unhandledrejection",a),Object.defineProperty(o,"getContext",i)}}
+            watchWebgl(window, () => realParent.postMessage({ type: 'webglUnavailable' }, '*'));
+          })();
+        } catch (e) {}
+
+        // Last, so that if this throws, everything above is already set up. In its own function, so that its names stay local.
+        (() => {
+          function forwardConsole(o,t){const e=String,i=n=>{try{return e(n??"")}catch{return"[object Object]"}},c=[["log",""],["error","Error: "],["warn","Warning: "]];for(const[n,s]of c){const f=o[n];o[n]=(...r)=>{f.apply(o,r),t(s+r.map(i).join(" "))}}}
+          forwardConsole(window.console, (line) => realParent.postMessage({ type: 'console', message: line }, '*'));
+        })();
+      })();
+    </script>
+  <style id="claude-scrollbar">@layer claude-scrollbar{*{scrollbar-width:thin}html{scrollbar-color:rgb(128 128 128 / 50%) transparent}}</style><style id="claude-safe-area">body{border-bottom:env(safe-area-inset-bottom,0px) solid transparent}</style>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="名古屋市南区元鳴尾町のプライベートサロン「RHP hair design」の公式Web予約＆店舗管理システム。">
+  <title>RHP hair design | Web予約＆店舗管理システム</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;500;700&display=swap');
+    body { font-family: 'Noto Sans JP', sans-serif; }
+    .modal-bg { background-color: rgba(0, 0, 0, 0.65); }
+    .hidden { display: none !important; }       
+  </style>
+<style>*, ::before, ::after{--tw-border-spacing-x:0;--tw-border-spacing-y:0;--tw-translate-x:0;--tw-translate-y:0;--tw-rotate:0;--tw-skew-x:0;--tw-skew-y:0;--tw-scale-x:1;--tw-scale-y:1;--tw-pan-x: ;--tw-pan-y: ;--tw-pinch-zoom: ;--tw-scroll-snap-strictness:proximity;--tw-gradient-from-position: ;--tw-gradient-via-position: ;--tw-gradient-to-position: ;--tw-ordinal: ;--tw-slashed-zero: ;--tw-numeric-figure: ;--tw-numeric-spacing: ;--tw-numeric-fraction: ;--tw-ring-inset: ;--tw-ring-offset-width:0px;--tw-ring-offset-color:#fff;--tw-ring-color:rgb(59 130 246 / 0.5);--tw-ring-offset-shadow:0 0 #0000;--tw-ring-shadow:0 0 #0000;--tw-shadow:0 0 #0000;--tw-shadow-colored:0 0 #0000;--tw-blur: ;--tw-brightness: ;--tw-contrast: ;--tw-grayscale: ;--tw-hue-rotate: ;--tw-invert: ;--tw-saturate: ;--tw-sepia: ;--tw-drop-shadow: ;--tw-backdrop-blur: ;--tw-backdrop-brightness: ;--tw-backdrop-contrast: ;--tw-backdrop-grayscale: ;--tw-backdrop-hue-rotate: ;--tw-backdrop-invert: ;--tw-backdrop-opacity: ;--tw-backdrop-saturate: ;--tw-backdrop-sepia: ;--tw-contain-size: ;--tw-contain-layout: ;--tw-contain-paint: ;--tw-contain-style: }::backdrop{--tw-border-spacing-x:0;--tw-border-spacing-y:0;--tw-translate-x:0;--tw-translate-y:0;--tw-rotate:0;--tw-skew-x:0;--tw-skew-y:0;--tw-scale-x:1;--tw-scale-y:1;--tw-pan-x: ;--tw-pan-y: ;--tw-pinch-zoom: ;--tw-scroll-snap-strictness:proximity;--tw-gradient-from-position: ;--tw-gradient-via-position: ;--tw-gradient-to-position: ;--tw-ordinal: ;--tw-slashed-zero: ;--tw-numeric-figure: ;--tw-numeric-spacing: ;--tw-numeric-fraction: ;--tw-ring-inset: ;--tw-ring-offset-width:0px;--tw-ring-offset-color:#fff;--tw-ring-color:rgb(59 130 246 / 0.5);--tw-ring-offset-shadow:0 0 #0000;--tw-ring-shadow:0 0 #0000;--tw-shadow:0 0 #0000;--tw-shadow-colored:0 0 #0000;--tw-blur: ;--tw-brightness: ;--tw-contrast: ;--tw-grayscale: ;--tw-hue-rotate: ;--tw-invert: ;--tw-saturate: ;--tw-sepia: ;--tw-drop-shadow: ;--tw-backdrop-blur: ;--tw-backdrop-brightness: ;--tw-backdrop-contrast: ;--tw-backdrop-grayscale: ;--tw-backdrop-hue-rotate: ;--tw-backdrop-invert: ;--tw-backdrop-opacity: ;--tw-backdrop-saturate: ;--tw-backdrop-sepia: ;--tw-contain-size: ;--tw-contain-layout: ;--tw-contain-paint: ;--tw-contain-style: }/* ! tailwindcss v3.4.17 | MIT License | https://tailwindcss.com */*,::after,::before{box-sizing:border-box;border-width:0;border-style:solid;border-color:#e5e7eb}::after,::before{--tw-content:''}:host,html{line-height:1.5;-webkit-text-size-adjust:100%;-moz-tab-size:4;tab-size:4;font-family:ui-sans-serif, system-ui, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji";font-feature-settings:normal;font-variation-settings:normal;-webkit-tap-highlight-color:transparent}body{margin:0;line-height:inherit}hr{height:0;color:inherit;border-top-width:1px}abbr:where([title]){-webkit-text-decoration:underline dotted;text-decoration:underline dotted}h1,h2,h3,h4,h5,h6{font-size:inherit;font-weight:inherit}a{color:inherit;text-decoration:inherit}b,strong{font-weight:bolder}code,kbd,pre,samp{font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;font-feature-settings:normal;font-variation-settings:normal;font-size:1em}small{font-size:80%}sub,sup{font-size:75%;line-height:0;position:relative;vertical-align:baseline}sub{bottom:-.25em}sup{top:-.5em}table{text-indent:0;border-color:inherit;border-collapse:collapse}button,input,optgroup,select,textarea{font-family:inherit;font-feature-settings:inherit;font-variation-settings:inherit;font-size:100%;font-weight:inherit;line-height:inherit;letter-spacing:inherit;color:inherit;margin:0;padding:0}button,select{text-transform:none}button,input:where([type=button]),input:where([type=reset]),input:where([type=submit]){-webkit-appearance:button;background-color:transparent;background-image:none}:-moz-focusring{outline:auto}:-moz-ui-invalid{box-shadow:none}progress{vertical-align:baseline}::-webkit-inner-spin-button,::-webkit-outer-spin-button{height:auto}[type=search]{-webkit-appearance:textfield;outline-offset:-2px}::-webkit-search-decoration{-webkit-appearance:none}::-webkit-file-upload-button{-webkit-appearance:button;font:inherit}summary{display:list-item}blockquote,dd,dl,figure,h1,h2,h3,h4,h5,h6,hr,p,pre{margin:0}fieldset{margin:0;padding:0}legend{padding:0}menu,ol,ul{list-style:none;margin:0;padding:0}dialog{padding:0}textarea{resize:vertical}input::placeholder,textarea::placeholder{opacity:1;color:#9ca3af}[role=button],button{cursor:pointer}:disabled{cursor:default}audio,canvas,embed,iframe,img,object,svg,video{display:block;vertical-align:middle}img,video{max-width:100%;height:auto}[hidden]:where(:not([hidden=until-found])){display:none}.fixed{position:fixed}.absolute{position:absolute}.relative{position:relative}.sticky{position:sticky}.inset-0{inset:0px}.left-3{left:0.75rem}.top-0{top:0px}.top-2\.5{top:0.625rem}.z-10{z-index:10}.z-40{z-index:40}.z-50{z-index:50}.col-span-2{grid-column:span 2 / span 2}.mx-auto{margin-left:auto;margin-right:auto}.mb-1{margin-bottom:0.25rem}.mb-2{margin-bottom:0.5rem}.mb-3{margin-bottom:0.75rem}.mb-4{margin-bottom:1rem}.mb-5{margin-bottom:1.25rem}.mb-6{margin-bottom:1.5rem}.mt-0\.5{margin-top:0.125rem}.mt-1{margin-top:0.25rem}.mt-2{margin-top:0.5rem}.mt-4{margin-top:1rem}.mt-6{margin-top:1.5rem}.ml-1{margin-left:0.25rem}.block{display:block}.inline-block{display:inline-block}.flex{display:flex}.inline-flex{display:inline-flex}.grid{display:grid}.hidden{display:none}.h-10{height:2.5rem}.h-12{height:3rem}.h-4{height:1rem}.h-6{height:1.5rem}.max-h-48{max-height:12rem}.max-h-80{max-height:20rem}.max-h-\[90vh\]{max-height:90vh}.min-h-screen{min-height:100vh}.w-10{width:2.5rem}.w-12{width:3rem}.w-4{width:1rem}.w-6{width:1.5rem}.w-full{width:100%}.max-w-3xl{max-width:48rem}.max-w-lg{max-width:32rem}.max-w-md{max-width:28rem}.max-w-sm{max-width:24rem}.flex-1{flex:1 1 0%}.cursor-not-allowed{cursor:not-allowed}.cursor-pointer{cursor:pointer}.grid-cols-2{grid-template-columns:repeat(2, minmax(0, 1fr))}.grid-cols-3{grid-template-columns:repeat(3, minmax(0, 1fr))}.flex-wrap{flex-wrap:wrap}.items-start{align-items:flex-start}.items-center{align-items:center}.justify-center{justify-content:center}.justify-between{justify-content:space-between}.gap-1{gap:0.25rem}.gap-1\.5{gap:0.375rem}.gap-2{gap:0.5rem}.gap-3{gap:0.75rem}.space-y-2 > :not([hidden]) ~ :not([hidden]){--tw-space-y-reverse:0;margin-top:calc(0.5rem * calc(1 - var(--tw-space-y-reverse)));margin-bottom:calc(0.5rem * var(--tw-space-y-reverse))}.space-y-3 > :not([hidden]) ~ :not([hidden]){--tw-space-y-reverse:0;margin-top:calc(0.75rem * calc(1 - var(--tw-space-y-reverse)));margin-bottom:calc(0.75rem * var(--tw-space-y-reverse))}.space-y-4 > :not([hidden]) ~ :not([hidden]){--tw-space-y-reverse:0;margin-top:calc(1rem * calc(1 - var(--tw-space-y-reverse)));margin-bottom:calc(1rem * var(--tw-space-y-reverse))}.space-y-6 > :not([hidden]) ~ :not([hidden]){--tw-space-y-reverse:0;margin-top:calc(1.5rem * calc(1 - var(--tw-space-y-reverse)));margin-bottom:calc(1.5rem * var(--tw-space-y-reverse))}.overflow-hidden{overflow:hidden}.overflow-x-auto{overflow-x:auto}.overflow-y-auto{overflow-y:auto}.whitespace-pre-wrap{white-space:pre-wrap}.rounded{border-radius:0.25rem}.rounded-2xl{border-radius:1rem}.rounded-3xl{border-radius:1.5rem}.rounded-full{border-radius:9999px}.rounded-lg{border-radius:0.5rem}.rounded-xl{border-radius:0.75rem}.rounded-md{border-radius:0.375rem}.border{border-width:1px}.border-2{border-width:2px}.border-b{border-bottom-width:1px}.border-t{border-top-width:1px}.border-amber-200{--tw-border-opacity:1;border-color:rgb(253 230 138 / var(--tw-border-opacity, 1))}.border-amber-300{--tw-border-opacity:1;border-color:rgb(252 211 77 / var(--tw-border-opacity, 1))}.border-amber-400{--tw-border-opacity:1;border-color:rgb(251 191 36 / var(--tw-border-opacity, 1))}.border-amber-500\/40{border-color:rgb(245 158 11 / 0.4)}.border-blue-200{--tw-border-opacity:1;border-color:rgb(191 219 254 / var(--tw-border-opacity, 1))}.border-emerald-200{--tw-border-opacity:1;border-color:rgb(167 243 208 / var(--tw-border-opacity, 1))}.border-gray-200{--tw-border-opacity:1;border-color:rgb(229 231 235 / var(--tw-border-opacity, 1))}.border-slate-700{--tw-border-opacity:1;border-color:rgb(51 65 85 / var(--tw-border-opacity, 1))}.bg-amber-50{--tw-bg-opacity:1;background-color:rgb(255 251 235 / var(--tw-bg-opacity, 1))}.bg-amber-50\/50{background-color:rgb(255 251 235 / 0.5)}.bg-amber-50\/70{background-color:rgb(255 251 235 / 0.7)}.bg-amber-500{--tw-bg-opacity:1;background-color:rgb(245 158 11 / var(--tw-bg-opacity, 1))}.bg-amber-500\/20{background-color:rgb(245 158 11 / 0.2)}.bg-blue-50{--tw-bg-opacity:1;background-color:rgb(239 246 255 / var(--tw-bg-opacity, 1))}.bg-emerald-100{--tw-bg-opacity:1;background-color:rgb(209 250 229 / var(--tw-bg-opacity, 1))}.bg-emerald-50{--tw-bg-opacity:1;background-color:rgb(236 253 245 / var(--tw-bg-opacity, 1))}.bg-emerald-500{--tw-bg-opacity:1;background-color:rgb(16 185 129 / var(--tw-bg-opacity, 1))}.bg-gray-100{--tw-bg-opacity:1;background-color:rgb(243 244 246 / var(--tw-bg-opacity, 1))}.bg-gray-200{--tw-bg-opacity:1;background-color:rgb(229 231 235 / var(--tw-bg-opacity, 1))}.bg-gray-50{--tw-bg-opacity:1;background-color:rgb(249 250 251 / var(--tw-bg-opacity, 1))}.bg-red-100{--tw-bg-opacity:1;background-color:rgb(254 226 226 / var(--tw-bg-opacity, 1))}.bg-slate-50{--tw-bg-opacity:1;background-color:rgb(248 250 252 / var(--tw-bg-opacity, 1))}.bg-slate-800{--tw-bg-opacity:1;background-color:rgb(30 41 59 / var(--tw-bg-opacity, 1))}.bg-slate-900{--tw-bg-opacity:1;background-color:rgb(15 23 42 / var(--tw-bg-opacity, 1))}.bg-white{--tw-bg-opacity:1;background-color:rgb(255 255 255 / var(--tw-bg-opacity, 1))}.bg-amber-100{--tw-bg-opacity:1;background-color:rgb(254 243 199 / var(--tw-bg-opacity, 1))}.bg-red-500{--tw-bg-opacity:1;background-color:rgb(239 68 68 / var(--tw-bg-opacity, 1))}.bg-gradient-to-br{background-image:linear-gradient(to bottom right, var(--tw-gradient-stops))}.bg-gradient-to-r{background-image:linear-gradient(to right, var(--tw-gradient-stops))}.from-amber-400{--tw-gradient-from:#fbbf24 var(--tw-gradient-from-position);--tw-gradient-to:rgb(251 191 36 / 0) var(--tw-gradient-to-position);--tw-gradient-stops:var(--tw-gradient-from), var(--tw-gradient-to)}.from-purple-500{--tw-gradient-from:#a855f7 var(--tw-gradient-from-position);--tw-gradient-to:rgb(168 85 247 / 0) var(--tw-gradient-to-position);--tw-gradient-stops:var(--tw-gradient-from), var(--tw-gradient-to)}.via-pink-500{--tw-gradient-to:rgb(236 72 153 / 0)  var(--tw-gradient-to-position);--tw-gradient-stops:var(--tw-gradient-from), #ec4899 var(--tw-gradient-via-position), var(--tw-gradient-to)}.to-amber-500{--tw-gradient-to:#f59e0b var(--tw-gradient-to-position)}.to-amber-600{--tw-gradient-to:#d97706 var(--tw-gradient-to-position)}.p-2\.5{padding:0.625rem}.p-3{padding:0.75rem}.p-3\.5{padding:0.875rem}.p-4{padding:1rem}.p-5{padding:1.25rem}.p-6{padding:1.5rem}.px-2{padding-left:0.5rem;padding-right:0.5rem}.px-2\.5{padding-left:0.625rem;padding-right:0.625rem}.px-3{padding-left:0.75rem;padding-right:0.75rem}.px-4{padding-left:1rem;padding-right:1rem}.py-0\.5{padding-top:0.125rem;padding-bottom:0.125rem}.py-1{padding-top:0.25rem;padding-bottom:0.25rem}.py-1\.5{padding-top:0.375rem;padding-bottom:0.375rem}.py-2{padding-top:0.5rem;padding-bottom:0.5rem}.py-2\.5{padding-top:0.625rem;padding-bottom:0.625rem}.py-3{padding-top:0.75rem;padding-bottom:0.75rem}.py-3\.5{padding-top:0.875rem;padding-bottom:0.875rem}.py-4{padding-top:1rem;padding-bottom:1rem}.px-3\.5{padding-left:0.875rem;padding-right:0.875rem}.pb-12{padding-bottom:3rem}.pb-2{padding-bottom:0.5rem}.pb-3{padding-bottom:0.75rem}.pb-4{padding-bottom:1rem}.pl-8{padding-left:2rem}.pr-1{padding-right:0.25rem}.pr-3{padding-right:0.75rem}.pt-2{padding-top:0.5rem}.pt-4{padding-top:1rem}.text-center{text-align:center}.text-right{text-align:right}.font-mono{font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace}.text-2xl{font-size:1.5rem;line-height:2rem}.text-\[10px\]{font-size:10px}.text-\[11px\]{font-size:11px}.text-base{font-size:1rem;line-height:1.5rem}.text-lg{font-size:1.125rem;line-height:1.75rem}.text-sm{font-size:0.875rem;line-height:1.25rem}.text-xl{font-size:1.25rem;line-height:1.75rem}.text-xs{font-size:0.75rem;line-height:1rem}.font-bold{font-weight:700}.font-medium{font-weight:500}.font-normal{font-weight:400}.leading-relaxed{line-height:1.625}.tracking-wider{letter-spacing:0.05em}.tracking-widest{letter-spacing:0.1em}.text-amber-300{--tw-text-opacity:1;color:rgb(252 211 77 / var(--tw-text-opacity, 1))}.text-amber-400{--tw-text-opacity:1;color:rgb(251 191 36 / var(--tw-text-opacity, 1))}.text-amber-500{--tw-text-opacity:1;color:rgb(245 158 11 / var(--tw-text-opacity, 1))}.text-amber-600{--tw-text-opacity:1;color:rgb(217 119 6 / var(--tw-text-opacity, 1))}.text-amber-700{--tw-text-opacity:1;color:rgb(180 83 9 / var(--tw-text-opacity, 1))}.text-amber-900{--tw-text-opacity:1;color:rgb(120 53 15 / var(--tw-text-opacity, 1))}.text-blue-700{--tw-text-opacity:1;color:rgb(29 78 216 / var(--tw-text-opacity, 1))}.text-emerald-500{--tw-text-opacity:1;color:rgb(16 185 129 / var(--tw-text-opacity, 1))}.text-emerald-700{--tw-text-opacity:1;color:rgb(4 120 87 / var(--tw-text-opacity, 1))}.text-gray-400{--tw-text-opacity:1;color:rgb(156 163 175 / var(--tw-text-opacity, 1))}.text-gray-500{--tw-text-opacity:1;color:rgb(107 114 128 / var(--tw-text-opacity, 1))}.text-gray-600{--tw-text-opacity:1;color:rgb(75 85 99 / var(--tw-text-opacity, 1))}.text-gray-700{--tw-text-opacity:1;color:rgb(55 65 81 / var(--tw-text-opacity, 1))}.text-gray-800{--tw-text-opacity:1;color:rgb(31 41 55 / var(--tw-text-opacity, 1))}.text-red-400{--tw-text-opacity:1;color:rgb(248 113 113 / var(--tw-text-opacity, 1))}.text-red-500{--tw-text-opacity:1;color:rgb(239 68 68 / var(--tw-text-opacity, 1))}.text-red-600{--tw-text-opacity:1;color:rgb(220 38 38 / var(--tw-text-opacity, 1))}.text-slate-300{--tw-text-opacity:1;color:rgb(203 213 225 / var(--tw-text-opacity, 1))}.text-slate-400{--tw-text-opacity:1;color:rgb(148 163 184 / var(--tw-text-opacity, 1))}.text-slate-900{--tw-text-opacity:1;color:rgb(15 23 42 / var(--tw-text-opacity, 1))}.text-white{--tw-text-opacity:1;color:rgb(255 255 255 / var(--tw-text-opacity, 1))}.underline{-webkit-text-decoration-line:underline;text-decoration-line:underline}.accent-amber-500{accent-color:#f59e0b}.shadow{--tw-shadow:0 1px 3px 0 rgb(0 0 0 / 0.1), 0 1px 2px -1px rgb(0 0 0 / 0.1);--tw-shadow-colored:0 1px 3px 0 var(--tw-shadow-color), 0 1px 2px -1px var(--tw-shadow-color);box-shadow:var(--tw-ring-offset-shadow, 0 0 #0000), var(--tw-ring-shadow, 0 0 #0000), var(--tw-shadow)}.shadow-2xl{--tw-shadow:0 25px 50px -12px rgb(0 0 0 / 0.25);--tw-shadow-colored:0 25px 50px -12px var(--tw-shadow-color);box-shadow:var(--tw-ring-offset-shadow, 0 0 #0000), var(--tw-ring-shadow, 0 0 #0000), var(--tw-shadow)}.shadow-md{--tw-shadow:0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);--tw-shadow-colored:0 4px 6px -1px var(--tw-shadow-color), 0 2px 4px -2px var(--tw-shadow-color);box-shadow:var(--tw-ring-offset-shadow, 0 0 #0000), var(--tw-ring-shadow, 0 0 #0000), var(--tw-shadow)}.shadow-sm{--tw-shadow:0 1px 2px 0 rgb(0 0 0 / 0.05);--tw-shadow-colored:0 1px 2px 0 var(--tw-shadow-color);box-shadow:var(--tw-ring-offset-shadow, 0 0 #0000), var(--tw-ring-shadow, 0 0 #0000), var(--tw-shadow)}.transition{transition-property:color, background-color, border-color, fill, stroke, opacity, box-shadow, transform, filter, -webkit-text-decoration-color, -webkit-backdrop-filter;transition-property:color, background-color, border-color, text-decoration-color, fill, stroke, opacity, box-shadow, transform, filter, backdrop-filter;transition-property:color, background-color, border-color, text-decoration-color, fill, stroke, opacity, box-shadow, transform, filter, backdrop-filter, -webkit-text-decoration-color, -webkit-backdrop-filter;transition-timing-function:cubic-bezier(0.4, 0, 0.2, 1);transition-duration:150ms}.hover\:border-amber-300:hover{--tw-border-opacity:1;border-color:rgb(252 211 77 / var(--tw-border-opacity, 1))}.hover\:bg-amber-400:hover{--tw-bg-opacity:1;background-color:rgb(251 191 36 / var(--tw-bg-opacity, 1))}.hover\:bg-amber-600:hover{--tw-bg-opacity:1;background-color:rgb(217 119 6 / var(--tw-bg-opacity, 1))}.hover\:bg-emerald-600:hover{--tw-bg-opacity:1;background-color:rgb(5 150 105 / var(--tw-bg-opacity, 1))}.hover\:bg-gray-100:hover{--tw-bg-opacity:1;background-color:rgb(243 244 246 / var(--tw-bg-opacity, 1))}.hover\:bg-red-200:hover{--tw-bg-opacity:1;background-color:rgb(254 202 202 / var(--tw-bg-opacity, 1))}.hover\:bg-slate-700:hover{--tw-bg-opacity:1;background-color:rgb(51 65 85 / var(--tw-bg-opacity, 1))}.hover\:bg-slate-800:hover{--tw-bg-opacity:1;background-color:rgb(30 41 59 / var(--tw-bg-opacity, 1))}.hover\:bg-gray-200:hover{--tw-bg-opacity:1;background-color:rgb(229 231 235 / var(--tw-bg-opacity, 1))}.hover\:text-gray-600:hover{--tw-text-opacity:1;color:rgb(75 85 99 / var(--tw-text-opacity, 1))}</style><style>*, ::before, ::after{--tw-border-spacing-x:0;--tw-border-spacing-y:0;--tw-translate-x:0;--tw-translate-y:0;--tw-rotate:0;--tw-skew-x:0;--tw-skew-y:0;--tw-scale-x:1;--tw-scale-y:1;--tw-pan-x: ;--tw-pan-y: ;--tw-pinch-zoom: ;--tw-scroll-snap-strictness:proximity;--tw-gradient-from-position: ;--tw-gradient-via-position: ;--tw-gradient-to-position: ;--tw-ordinal: ;--tw-slashed-zero: ;--tw-numeric-figure: ;--tw-numeric-spacing: ;--tw-numeric-fraction: ;--tw-ring-inset: ;--tw-ring-offset-width:0px;--tw-ring-offset-color:#fff;--tw-ring-color:rgb(59 130 246 / 0.5);--tw-ring-offset-shadow:0 0 #0000;--tw-ring-shadow:0 0 #0000;--tw-shadow:0 0 #0000;--tw-shadow-colored:0 0 #0000;--tw-blur: ;--tw-brightness: ;--tw-contrast: ;--tw-grayscale: ;--tw-hue-rotate: ;--tw-invert: ;--tw-saturate: ;--tw-sepia: ;--tw-drop-shadow: ;--tw-backdrop-blur: ;--tw-backdrop-brightness: ;--tw-backdrop-contrast: ;--tw-backdrop-grayscale: ;--tw-backdrop-hue-rotate: ;--tw-backdrop-invert: ;--tw-backdrop-opacity: ;--tw-backdrop-saturate: ;--tw-backdrop-sepia: ;--tw-contain-size: ;--tw-contain-layout: ;--tw-contain-paint: ;--tw-contain-style: }::backdrop{--tw-border-spacing-x:0;--tw-border-spacing-y:0;--tw-translate-x:0;--tw-translate-y:0;--tw-rotate:0;--tw-skew-x:0;--tw-skew-y:0;--tw-scale-x:1;--tw-scale-y:1;--tw-pan-x: ;--tw-pan-y: ;--tw-pinch-zoom: ;--tw-scroll-snap-strictness:proximity;--tw-gradient-from-position: ;--tw-gradient-via-position: ;--tw-gradient-to-position: ;--tw-ordinal: ;--tw-slashed-zero: ;--tw-numeric-figure: ;--tw-numeric-spacing: ;--tw-numeric-fraction: ;--tw-ring-inset: ;--tw-ring-offset-width:0px;--tw-ring-offset-color:#fff;--tw-ring-color:rgb(59 130 246 / 0.5);--tw-ring-offset-shadow:0 0 #0000;--tw-ring-shadow:0 0 #0000;--tw-shadow:0 0 #0000;--tw-shadow-colored:0 0 #0000;--tw-blur: ;--tw-brightness: ;--tw-contrast: ;--tw-grayscale: ;--tw-hue-rotate: ;--tw-invert: ;--tw-saturate: ;--tw-sepia: ;--tw-drop-shadow: ;--tw-backdrop-blur: ;--tw-backdrop-brightness: ;--tw-backdrop-contrast: ;--tw-backdrop-grayscale: ;--tw-backdrop-hue-rotate: ;--tw-backdrop-invert: ;--tw-backdrop-opacity: ;--tw-backdrop-saturate: ;--tw-backdrop-sepia: ;--tw-contain-size: ;--tw-contain-layout: ;--tw-contain-paint: ;--tw-contain-style: }/* ! tailwindcss v3.4.17 | MIT License | https://tailwindcss.com */*,::after,::before{box-sizing:border-box;border-width:0;border-style:solid;border-color:#e5e7eb}::after,::before{--tw-content:''}:host,html{line-height:1.5;-webkit-text-size-adjust:100%;-moz-tab-size:4;tab-size:4;font-family:ui-sans-serif, system-ui, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji";font-feature-settings:normal;font-variation-settings:normal;-webkit-tap-highlight-color:transparent}body{margin:0;line-height:inherit}hr{height:0;color:inherit;border-top-width:1px}abbr:where([title]){-webkit-text-decoration:underline dotted;text-decoration:underline dotted}h1,h2,h3,h4,h5,h6{font-size:inherit;font-weight:inherit}a{color:inherit;text-decoration:inherit}b,strong{font-weight:bolder}code,kbd,pre,samp{font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;font-feature-settings:normal;font-variation-settings:normal;font-size:1em}small{font-size:80%}sub,sup{font-size:75%;line-height:0;position:relative;vertical-align:baseline}sub{bottom:-.25em}sup{top:-.5em}table{text-indent:0;border-color:inherit;border-collapse:collapse}button,input,optgroup,select,textarea{font-family:inherit;font-feature-settings:inherit;font-variation-settings:inherit;font-size:100%;font-weight:inherit;line-height:inherit;letter-spacing:inherit;color:inherit;margin:0;padding:0}button,select{text-transform:none}button,input:where([type=button]),input:where([type=reset]),input:where([type=submit]){-webkit-appearance:button;background-color:transparent;background-image:none}:-moz-focusring{outline:auto}:-moz-ui-invalid{box-shadow:none}progress{vertical-align:baseline}::-webkit-inner-spin-button,::-webkit-outer-spin-button{height:auto}[type=search]{-webkit-appearance:textfield;outline-offset:-2px}::-webkit-search-decoration{-webkit-appearance:none}::-webkit-file-upload-button{-webkit-appearance:button;font:inherit}summary{display:list-item}blockquote,dd,dl,figure,h1,h2,h3,h4,h5,h6,hr,p,pre{margin:0}fieldset{margin:0;padding:0}legend{padding:0}menu,ol,ul{list-style:none;margin:0;padding:0}dialog{padding:0}textarea{resize:vertical}input::placeholder,textarea::placeholder{opacity:1;color:#9ca3af}[role=button],button{cursor:pointer}:disabled{cursor:default}audio,canvas,embed,iframe,img,object,svg,video{display:block;vertical-align:middle}img,video{max-width:100%;height:auto}[hidden]:where(:not([hidden=until-found])){display:none}.fixed{position:fixed}.absolute{position:absolute}.relative{position:relative}.sticky{position:sticky}.inset-0{inset:0px}.left-3{left:0.75rem}.top-0{top:0px}.top-2\.5{top:0.625rem}.z-10{z-index:10}.z-40{z-index:40}.z-50{z-index:50}.col-span-2{grid-column:span 2 / span 2}.mx-auto{margin-left:auto;margin-right:auto}.mb-1{margin-bottom:0.25rem}.mb-2{margin-bottom:0.5rem}.mb-3{margin-bottom:0.75rem}.mb-4{margin-bottom:1rem}.mb-5{margin-bottom:1.25rem}.mb-6{margin-bottom:1.5rem}.ml-1{margin-left:0.25rem}.mt-0\.5{margin-top:0.125rem}.mt-1{margin-top:0.25rem}.mt-2{margin-top:0.5rem}.mt-4{margin-top:1rem}.mt-6{margin-top:1.5rem}.mt-3{margin-top:0.75rem}.block{display:block}.inline-block{display:inline-block}.flex{display:flex}.inline-flex{display:inline-flex}.grid{display:grid}.hidden{display:none}.h-10{height:2.5rem}.h-12{height:3rem}.h-4{height:1rem}.h-6{height:1.5rem}.max-h-48{max-height:12rem}.max-h-80{max-height:20rem}.max-h-\[90vh\]{max-height:90vh}.min-h-screen{min-height:100vh}.w-10{width:2.5rem}.w-12{width:3rem}.w-4{width:1rem}.w-6{width:1.5rem}.w-full{width:100%}.min-w-0{min-width:0px}.max-w-3xl{max-width:48rem}.max-w-lg{max-width:32rem}.max-w-md{max-width:28rem}.max-w-sm{max-width:24rem}.flex-1{flex:1 1 0%}.shrink-0{flex-shrink:0}.cursor-not-allowed{cursor:not-allowed}.cursor-pointer{cursor:pointer}.grid-cols-2{grid-template-columns:repeat(2, minmax(0, 1fr))}.grid-cols-3{grid-template-columns:repeat(3, minmax(0, 1fr))}.grid-cols-7{grid-template-columns:repeat(7, minmax(0, 1fr))}.flex-col{flex-direction:column}.flex-wrap{flex-wrap:wrap}.items-start{align-items:flex-start}.items-center{align-items:center}.justify-center{justify-content:center}.justify-between{justify-content:space-between}.gap-1{gap:0.25rem}.gap-1\.5{gap:0.375rem}.gap-2{gap:0.5rem}.gap-3{gap:0.75rem}.space-y-2 > :not([hidden]) ~ :not([hidden]){--tw-space-y-reverse:0;margin-top:calc(0.5rem * calc(1 - var(--tw-space-y-reverse)));margin-bottom:calc(0.5rem * var(--tw-space-y-reverse))}.space-y-3 > :not([hidden]) ~ :not([hidden]){--tw-space-y-reverse:0;margin-top:calc(0.75rem * calc(1 - var(--tw-space-y-reverse)));margin-bottom:calc(0.75rem * var(--tw-space-y-reverse))}.space-y-4 > :not([hidden]) ~ :not([hidden]){--tw-space-y-reverse:0;margin-top:calc(1rem * calc(1 - var(--tw-space-y-reverse)));margin-bottom:calc(1rem * var(--tw-space-y-reverse))}.space-y-6 > :not([hidden]) ~ :not([hidden]){--tw-space-y-reverse:0;margin-top:calc(1.5rem * calc(1 - var(--tw-space-y-reverse)));margin-bottom:calc(1.5rem * var(--tw-space-y-reverse))}.space-y-1\.5 > :not([hidden]) ~ :not([hidden]){--tw-space-y-reverse:0;margin-top:calc(0.375rem * calc(1 - var(--tw-space-y-reverse)));margin-bottom:calc(0.375rem * var(--tw-space-y-reverse))}.overflow-hidden{overflow:hidden}.overflow-x-auto{overflow-x:auto}.overflow-y-auto{overflow-y:auto}.whitespace-nowrap{white-space:nowrap}.whitespace-pre-wrap{white-space:pre-wrap}.break-words{overflow-wrap:break-word}.rounded{border-radius:0.25rem}.rounded-2xl{border-radius:1rem}.rounded-3xl{border-radius:1.5rem}.rounded-full{border-radius:9999px}.rounded-lg{border-radius:0.5rem}.rounded-md{border-radius:0.375rem}.rounded-xl{border-radius:0.75rem}.border{border-width:1px}.border-2{border-width:2px}.border-b{border-bottom-width:1px}.border-t{border-top-width:1px}.border-amber-200{--tw-border-opacity:1;border-color:rgb(253 230 138 / var(--tw-border-opacity, 1))}.border-amber-300{--tw-border-opacity:1;border-color:rgb(252 211 77 / var(--tw-border-opacity, 1))}.border-amber-400{--tw-border-opacity:1;border-color:rgb(251 191 36 / var(--tw-border-opacity, 1))}.border-amber-500\/40{border-color:rgb(245 158 11 / 0.4)}.border-blue-200{--tw-border-opacity:1;border-color:rgb(191 219 254 / var(--tw-border-opacity, 1))}.border-emerald-200{--tw-border-opacity:1;border-color:rgb(167 243 208 / var(--tw-border-opacity, 1))}.border-gray-200{--tw-border-opacity:1;border-color:rgb(229 231 235 / var(--tw-border-opacity, 1))}.border-slate-700{--tw-border-opacity:1;border-color:rgb(51 65 85 / var(--tw-border-opacity, 1))}.border-amber-500{--tw-border-opacity:1;border-color:rgb(245 158 11 / var(--tw-border-opacity, 1))}.bg-amber-100{--tw-bg-opacity:1;background-color:rgb(254 243 199 / var(--tw-bg-opacity, 1))}.bg-amber-50{--tw-bg-opacity:1;background-color:rgb(255 251 235 / var(--tw-bg-opacity, 1))}.bg-amber-50\/50{background-color:rgb(255 251 235 / 0.5)}.bg-amber-50\/70{background-color:rgb(255 251 235 / 0.7)}.bg-amber-500{--tw-bg-opacity:1;background-color:rgb(245 158 11 / var(--tw-bg-opacity, 1))}.bg-amber-500\/20{background-color:rgb(245 158 11 / 0.2)}.bg-blue-50{--tw-bg-opacity:1;background-color:rgb(239 246 255 / var(--tw-bg-opacity, 1))}.bg-emerald-100{--tw-bg-opacity:1;background-color:rgb(209 250 229 / var(--tw-bg-opacity, 1))}.bg-emerald-50{--tw-bg-opacity:1;background-color:rgb(236 253 245 / var(--tw-bg-opacity, 1))}.bg-emerald-500{--tw-bg-opacity:1;background-color:rgb(16 185 129 / var(--tw-bg-opacity, 1))}.bg-gray-100{--tw-bg-opacity:1;background-color:rgb(243 244 246 / var(--tw-bg-opacity, 1))}.bg-gray-200{--tw-bg-opacity:1;background-color:rgb(229 231 235 / var(--tw-bg-opacity, 1))}.bg-gray-50{--tw-bg-opacity:1;background-color:rgb(249 250 251 / var(--tw-bg-opacity, 1))}.bg-red-100{--tw-bg-opacity:1;background-color:rgb(254 226 226 / var(--tw-bg-opacity, 1))}.bg-red-500{--tw-bg-opacity:1;background-color:rgb(239 68 68 / var(--tw-bg-opacity, 1))}.bg-slate-50{--tw-bg-opacity:1;background-color:rgb(248 250 252 / var(--tw-bg-opacity, 1))}.bg-slate-800{--tw-bg-opacity:1;background-color:rgb(30 41 59 / var(--tw-bg-opacity, 1))}.bg-slate-900{--tw-bg-opacity:1;background-color:rgb(15 23 42 / var(--tw-bg-opacity, 1))}.bg-white{--tw-bg-opacity:1;background-color:rgb(255 255 255 / var(--tw-bg-opacity, 1))}.bg-amber-400{--tw-bg-opacity:1;background-color:rgb(251 191 36 / var(--tw-bg-opacity, 1))}.bg-emerald-600{--tw-bg-opacity:1;background-color:rgb(5 150 105 / var(--tw-bg-opacity, 1))}.bg-gradient-to-br{background-image:linear-gradient(to bottom right, var(--tw-gradient-stops))}.bg-gradient-to-r{background-image:linear-gradient(to right, var(--tw-gradient-stops))}.from-amber-400{--tw-gradient-from:#fbbf24 var(--tw-gradient-from-position);--tw-gradient-to:rgb(251 191 36 / 0) var(--tw-gradient-to-position);--tw-gradient-stops:var(--tw-gradient-from), var(--tw-gradient-to)}.from-purple-500{--tw-gradient-from:#a855f7 var(--tw-gradient-from-position);--tw-gradient-to:rgb(168 85 247 / 0) var(--tw-gradient-to-position);--tw-gradient-stops:var(--tw-gradient-from), var(--tw-gradient-to)}.via-pink-500{--tw-gradient-to:rgb(236 72 153 / 0)  var(--tw-gradient-to-position);--tw-gradient-stops:var(--tw-gradient-from), #ec4899 var(--tw-gradient-via-position), var(--tw-gradient-to)}.to-amber-500{--tw-gradient-to:#f59e0b var(--tw-gradient-to-position)}.to-amber-600{--tw-gradient-to:#d97706 var(--tw-gradient-to-position)}.p-2\.5{padding:0.625rem}.p-3{padding:0.75rem}.p-3\.5{padding:0.875rem}.p-4{padding:1rem}.p-5{padding:1.25rem}.p-6{padding:1.5rem}.px-2{padding-left:0.5rem;padding-right:0.5rem}.px-2\.5{padding-left:0.625rem;padding-right:0.625rem}.px-3{padding-left:0.75rem;padding-right:0.75rem}.px-3\.5{padding-left:0.875rem;padding-right:0.875rem}.px-4{padding-left:1rem;padding-right:1rem}.py-0\.5{padding-top:0.125rem;padding-bottom:0.125rem}.py-1{padding-top:0.25rem;padding-bottom:0.25rem}.py-1\.5{padding-top:0.375rem;padding-bottom:0.375rem}.py-2{padding-top:0.5rem;padding-bottom:0.5rem}.py-2\.5{padding-top:0.625rem;padding-bottom:0.625rem}.py-3{padding-top:0.75rem;padding-bottom:0.75rem}.py-3\.5{padding-top:0.875rem;padding-bottom:0.875rem}.py-4{padding-top:1rem;padding-bottom:1rem}.pb-12{padding-bottom:3rem}.pb-2{padding-bottom:0.5rem}.pb-3{padding-bottom:0.75rem}.pb-4{padding-bottom:1rem}.pl-8{padding-left:2rem}.pr-1{padding-right:0.25rem}.pr-3{padding-right:0.75rem}.pt-2{padding-top:0.5rem}.pt-4{padding-top:1rem}.text-center{text-align:center}.text-right{text-align:right}.font-mono{font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace}.text-2xl{font-size:1.5rem;line-height:2rem}.text-\[10px\]{font-size:10px}.text-\[11px\]{font-size:11px}.text-base{font-size:1rem;line-height:1.5rem}.text-lg{font-size:1.125rem;line-height:1.75rem}.text-sm{font-size:0.875rem;line-height:1.25rem}.text-xl{font-size:1.25rem;line-height:1.75rem}.text-xs{font-size:0.75rem;line-height:1rem}.text-\[9px\]{font-size:9px}.font-bold{font-weight:700}.font-medium{font-weight:500}.font-normal{font-weight:400}.uppercase{text-transform:uppercase}.leading-relaxed{line-height:1.625}.tracking-wider{letter-spacing:0.05em}.tracking-widest{letter-spacing:0.1em}.text-amber-300{--tw-text-opacity:1;color:rgb(252 211 77 / var(--tw-text-opacity, 1))}.text-amber-400{--tw-text-opacity:1;color:rgb(251 191 36 / var(--tw-text-opacity, 1))}.text-amber-500{--tw-text-opacity:1;color:rgb(245 158 11 / var(--tw-text-opacity, 1))}.text-amber-600{--tw-text-opacity:1;color:rgb(217 119 6 / var(--tw-text-opacity, 1))}.text-amber-700{--tw-text-opacity:1;color:rgb(180 83 9 / var(--tw-text-opacity, 1))}.text-amber-900{--tw-text-opacity:1;color:rgb(120 53 15 / var(--tw-text-opacity, 1))}.text-blue-700{--tw-text-opacity:1;color:rgb(29 78 216 / var(--tw-text-opacity, 1))}.text-emerald-500{--tw-text-opacity:1;color:rgb(16 185 129 / var(--tw-text-opacity, 1))}.text-emerald-700{--tw-text-opacity:1;color:rgb(4 120 87 / var(--tw-text-opacity, 1))}.text-gray-400{--tw-text-opacity:1;color:rgb(156 163 175 / var(--tw-text-opacity, 1))}.text-gray-500{--tw-text-opacity:1;color:rgb(107 114 128 / var(--tw-text-opacity, 1))}.text-gray-600{--tw-text-opacity:1;color:rgb(75 85 99 / var(--tw-text-opacity, 1))}.text-gray-700{--tw-text-opacity:1;color:rgb(55 65 81 / var(--tw-text-opacity, 1))}.text-gray-800{--tw-text-opacity:1;color:rgb(31 41 55 / var(--tw-text-opacity, 1))}.text-red-400{--tw-text-opacity:1;color:rgb(248 113 113 / var(--tw-text-opacity, 1))}.text-red-500{--tw-text-opacity:1;color:rgb(239 68 68 / var(--tw-text-opacity, 1))}.text-red-600{--tw-text-opacity:1;color:rgb(220 38 38 / var(--tw-text-opacity, 1))}.text-slate-300{--tw-text-opacity:1;color:rgb(203 213 225 / var(--tw-text-opacity, 1))}.text-slate-400{--tw-text-opacity:1;color:rgb(148 163 184 / var(--tw-text-opacity, 1))}.text-slate-900{--tw-text-opacity:1;color:rgb(15 23 42 / var(--tw-text-opacity, 1))}.text-white{--tw-text-opacity:1;color:rgb(255 255 255 / var(--tw-text-opacity, 1))}.text-blue-500{--tw-text-opacity:1;color:rgb(59 130 246 / var(--tw-text-opacity, 1))}.underline{-webkit-text-decoration-line:underline;text-decoration-line:underline}.accent-amber-500{accent-color:#f59e0b}.shadow{--tw-shadow:0 1px 3px 0 rgb(0 0 0 / 0.1), 0 1px 2px -1px rgb(0 0 0 / 0.1);--tw-shadow-colored:0 1px 3px 0 var(--tw-shadow-color), 0 1px 2px -1px var(--tw-shadow-color);box-shadow:var(--tw-ring-offset-shadow, 0 0 #0000), var(--tw-ring-shadow, 0 0 #0000), var(--tw-shadow)}.shadow-2xl{--tw-shadow:0 25px 50px -12px rgb(0 0 0 / 0.25);--tw-shadow-colored:0 25px 50px -12px var(--tw-shadow-color);box-shadow:var(--tw-ring-offset-shadow, 0 0 #0000), var(--tw-ring-shadow, 0 0 #0000), var(--tw-shadow)}.shadow-md{--tw-shadow:0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);--tw-shadow-colored:0 4px 6px -1px var(--tw-shadow-color), 0 2px 4px -2px var(--tw-shadow-color);box-shadow:var(--tw-ring-offset-shadow, 0 0 #0000), var(--tw-ring-shadow, 0 0 #0000), var(--tw-shadow)}.shadow-sm{--tw-shadow:0 1px 2px 0 rgb(0 0 0 / 0.05);--tw-shadow-colored:0 1px 2px 0 var(--tw-shadow-color);box-shadow:var(--tw-ring-offset-shadow, 0 0 #0000), var(--tw-ring-shadow, 0 0 #0000), var(--tw-shadow)}.ring-2{--tw-ring-offset-shadow:var(--tw-ring-inset) 0 0 0 var(--tw-ring-offset-width) var(--tw-ring-offset-color);--tw-ring-shadow:var(--tw-ring-inset) 0 0 0 calc(2px + var(--tw-ring-offset-width)) var(--tw-ring-color);box-shadow:var(--tw-ring-offset-shadow), var(--tw-ring-shadow), var(--tw-shadow, 0 0 #0000)}.ring-slate-900{--tw-ring-opacity:1;--tw-ring-color:rgb(15 23 42 / var(--tw-ring-opacity, 1))}.transition{transition-property:color, background-color, border-color, fill, stroke, opacity, box-shadow, transform, filter, -webkit-text-decoration-color, -webkit-backdrop-filter;transition-property:color, background-color, border-color, text-decoration-color, fill, stroke, opacity, box-shadow, transform, filter, backdrop-filter;transition-property:color, background-color, border-color, text-decoration-color, fill, stroke, opacity, box-shadow, transform, filter, backdrop-filter, -webkit-text-decoration-color, -webkit-backdrop-filter;transition-timing-function:cubic-bezier(0.4, 0, 0.2, 1);transition-duration:150ms}.hover\:border-amber-300:hover{--tw-border-opacity:1;border-color:rgb(252 211 77 / var(--tw-border-opacity, 1))}.hover\:bg-amber-400:hover{--tw-bg-opacity:1;background-color:rgb(251 191 36 / var(--tw-bg-opacity, 1))}.hover\:bg-amber-600:hover{--tw-bg-opacity:1;background-color:rgb(217 119 6 / var(--tw-bg-opacity, 1))}.hover\:bg-emerald-600:hover{--tw-bg-opacity:1;background-color:rgb(5 150 105 / var(--tw-bg-opacity, 1))}.hover\:bg-gray-100:hover{--tw-bg-opacity:1;background-color:rgb(243 244 246 / var(--tw-bg-opacity, 1))}.hover\:bg-gray-200:hover{--tw-bg-opacity:1;background-color:rgb(229 231 235 / var(--tw-bg-opacity, 1))}.hover\:bg-red-200:hover{--tw-bg-opacity:1;background-color:rgb(254 202 202 / var(--tw-bg-opacity, 1))}.hover\:bg-slate-700:hover{--tw-bg-opacity:1;background-color:rgb(51 65 85 / var(--tw-bg-opacity, 1))}.hover\:bg-slate-800:hover{--tw-bg-opacity:1;background-color:rgb(30 41 59 / var(--tw-bg-opacity, 1))}.hover\:text-gray-600:hover{--tw-text-opacity:1;color:rgb(75 85 99 / var(--tw-text-opacity, 1))}</style></head>
+<body class="bg-gray-100 text-gray-800 min-h-screen pb-12" id="artifacts-component-root-html">
+
+  <!-- ヘッダー -->
+  <header class="bg-slate-900 text-white shadow-md sticky top-0 z-40">
+    <div class="max-w-3xl mx-auto px-4 py-3 flex justify-between items-center">
+      <div class="flex items-center gap-3">
+        <div class="w-10 h-10 rounded-full bg-gradient-to-br from-amber-400 to-amber-600 flex items-center justify-center font-bold text-slate-900 shadow">
+          RHP
+        </div>
+        <div>
+          <h1 id="header-site-title" class="text-base font-bold tracking-wider">RHP HAIR DESIGN</h1>
+          <p id="header-site-sub" class="text-[11px] text-slate-400">名古屋市南区元鳴尾町 プライベートサロン</p>
+        </div>
+      </div>
+      <div class="flex gap-2">
+        <button type="button" onclick="showTab('booking')" class="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 rounded-xl text-xs flex items-center gap-1 border border-slate-700 cursor-pointer">
+          <i class="fa-solid fa-calendar-check text-amber-400"></i> Web予約
+        </button>
+        <button type="button" onclick="showTab('cancel')" class="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 rounded-xl text-xs flex items-center gap-1 border border-slate-700 cursor-pointer">
+          <i class="fa-solid fa-ban text-red-400"></i> 予約確認・取消
+        </button>
+        <button type="button" onclick="openAdminAuth()" class="px-3 py-1.5 bg-amber-500 hover:bg-amber-600 text-slate-900 font-bold rounded-xl text-xs flex items-center gap-1 shadow cursor-pointer">
+          <i class="fa-solid fa-lock"></i> 管理画面
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <!-- メインコンテンツ -->
+  <main class="max-w-3xl mx-auto px-4 mt-6">
+
+    <!-- TAB 1: 予約画面（初期表示：hiddenなし） -->
+    <div id="tab-booking" class="tab-content hidden" style="display: none;">
+      <!-- ヒーローカード -->
+      <div class="bg-slate-900 text-white rounded-3xl p-6 shadow-md mb-6 relative overflow-hidden">
+        <div class="relative z-10">
+          <span id="hero-tag" class="inline-block px-3 py-1 bg-amber-500/20 text-amber-300 border border-amber-500/40 text-xs rounded-full font-bold mb-3">完全マンツーマン施術</span>
+          <h2 id="hero-title" class="text-xl font-bold mb-2">大人の髪悩みに寄り添うプライベートサロン</h2>
+          <p id="hero-desc" class="text-xs text-slate-300 leading-relaxed mb-4">名古屋市南区元鳴尾町の隠れ家サロン。COTA・リケラ・ReFa取扱店。あなたの魅力を最大限に引き出すヘアスタイルと髪質改善をご提案します。</p>
+          <div class="flex flex-wrap gap-2">
+            <a id="link-line-btn" href="https://line.me" target="_blank" class="inline-flex items-center gap-1.5 px-3 py-1.5 bg-emerald-500 hover:bg-emerald-600 text-white font-bold rounded-xl text-xs transition shadow" rel="noopener noreferrer">
+              <i class="fa-brands fa-line text-sm"></i> 公式LINEご相談
+            </a>
+            <a id="link-insta-btn" href="https://instagram.com" target="_blank" class="inline-flex items-center gap-1.5 px-3 py-1.5 bg-gradient-to-r from-purple-500 via-pink-500 to-amber-500 text-white font-bold rounded-xl text-xs transition shadow" rel="noopener noreferrer">
+              <i class="fa-brands fa-instagram text-sm"></i> Instagram
+            </a>
+            <a id="link-map-btn" href="https://maps.google.com" target="_blank" class="inline-flex items-center gap-1.5 px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-white font-bold rounded-xl text-xs transition shadow border border-slate-700" rel="noopener noreferrer">
+              <i class="fa-solid fa-location-dot text-amber-400 text-sm"></i> アクセス・地図
+            </a>
+          </div>
+        </div>
+      </div>
+
+      <!-- 店舗からのお知らせ -->
+      <div id="news-banner-container" class="bg-amber-50 border border-amber-300 rounded-3xl p-4 shadow-sm mb-6 hidden">
+        <div class="flex items-center justify-between mb-2">
+          <span class="text-[11px] font-bold bg-amber-500 text-slate-900 px-2 py-0.5 rounded-lg flex items-center gap-1">
+            <i class="fa-solid fa-bullhorn"></i> お知らせ
+          </span>
+          <span id="news-date-display" class="text-[11px] text-gray-500 font-medium"></span>
+        </div>
+        <h4 id="news-title-display" class="font-bold text-sm text-gray-800 mb-1"></h4>
+        <p id="news-content-display" class="text-xs text-gray-600 leading-relaxed whitespace-pre-wrap"></p>
+      </div>
+
+      <!-- かんたん再予約（リピーター向け） -->
+      <div class="bg-white rounded-3xl p-5 shadow-sm border border-gray-200 mb-6">
+        <h3 class="font-bold text-gray-800 text-sm mb-2 flex items-center gap-2">
+          <i class="fa-solid fa-rotate text-amber-500"></i> リピーター様向け「かんたん過去履歴から再予約」
+        </h3>
+        <div class="flex gap-2">
+          <input type="tel" id="repeat-phone-input" placeholder="ご登録のお電話番号を入力..." class="flex-1 p-3 border rounded-xl text-xs bg-gray-50">
+          <button type="button" onclick="loadPastBooking()" class="px-4 py-3 bg-slate-900 hover:bg-slate-800 text-white font-bold rounded-xl text-xs shadow cursor-pointer">
+            前回メニューを呼出
+          </button>
+        </div>
+      </div>
+
+      <!-- STEP 1: メニュー選択 -->
+      <div class="bg-white rounded-3xl p-5 shadow-sm border border-gray-200 mb-6">
+        <div class="flex justify-between items-center mb-4 border-b pb-3">
+          <h3 class="font-bold text-gray-800 flex items-center gap-2">
+            <span class="w-6 h-6 rounded-full bg-amber-500 text-slate-900 text-xs flex items-center justify-center font-bold">1</span>
+            メニューを選択してください <span class="text-xs text-amber-600 font-normal">（複数選択可）</span>
+          </h3>
+        </div>
+
+        <!-- カテゴリタブ -->
+        <div id="menu-category-tabs" class="flex flex-wrap gap-2 mb-4 pb-3 border-b overflow-x-auto">
+        <button type="button" onclick="selectCategory('すべて')" class="px-3.5 py-1.5 rounded-xl text-xs font-bold transition bg-amber-500 text-slate-900 shadow cursor-pointer">
+          すべて
+        </button>
+      
+        <button type="button" onclick="selectCategory('カット')" class="px-3.5 py-1.5 rounded-xl text-xs font-bold transition bg-gray-100 text-gray-600 hover:bg-gray-200 cursor-pointer">
+          カット
+        </button>
+      
+        <button type="button" onclick="selectCategory('カラー')" class="px-3.5 py-1.5 rounded-xl text-xs font-bold transition bg-gray-100 text-gray-600 hover:bg-gray-200 cursor-pointer">
+          カラー
+        </button>
+      
+        <button type="button" onclick="selectCategory('パーマ')" class="px-3.5 py-1.5 rounded-xl text-xs font-bold transition bg-gray-100 text-gray-600 hover:bg-gray-200 cursor-pointer">
+          パーマ
+        </button>
+      
+        <button type="button" onclick="selectCategory('縮毛矯正')" class="px-3.5 py-1.5 rounded-xl text-xs font-bold transition bg-gray-100 text-gray-600 hover:bg-gray-200 cursor-pointer">
+          縮毛矯正
+        </button>
+      
+        <button type="button" onclick="selectCategory('トリートメント')" class="px-3.5 py-1.5 rounded-xl text-xs font-bold transition bg-gray-100 text-gray-600 hover:bg-gray-200 cursor-pointer">
+          トリートメント
+        </button>
+      
+        <button type="button" onclick="selectCategory('スパ・その他')" class="px-3.5 py-1.5 rounded-xl text-xs font-bold transition bg-gray-100 text-gray-600 hover:bg-gray-200 cursor-pointer">
+          スパ・その他
+        </button>
+      </div>
+
+        <!-- メニュー一覧リスト -->
+        <div id="menu-list-container" class="space-y-3">
+          <div onclick="toggleMenuSelect(1)" class="p-4 rounded-2xl border transition cursor-pointer flex justify-between items-center border-gray-200 hover:border-amber-300 bg-white">
+            <div class="flex items-start gap-3">
+              <input type="checkbox" class="mt-1 w-4 h-4 accent-amber-500 rounded cursor-pointer">
+              <div>
+                <span class="text-[10px] font-bold text-amber-700 bg-amber-100 px-2 py-0.5 rounded-md inline-block mb-1">カット</span>
+                <h4 class="font-bold text-sm text-gray-800">カット</h4>
+                <p class="text-xs text-gray-500 mt-0.5">カット単品メニュー</p>
+                <div class="text-xs text-gray-400 mt-1"><i class="fa-regular fa-clock"></i> 所要時間: 約 60 分</div>
+              </div>
+            </div>
+            <div class="text-right font-bold text-slate-900 text-sm">
+              ¥5,900
+            </div>
+          </div>
+        
+          <div onclick="toggleMenuSelect(2)" class="p-4 rounded-2xl border transition cursor-pointer flex justify-between items-center border-gray-200 hover:border-amber-300 bg-white">
+            <div class="flex items-start gap-3">
+              <input type="checkbox" class="mt-1 w-4 h-4 accent-amber-500 rounded cursor-pointer">
+              <div>
+                <span class="text-[10px] font-bold text-amber-700 bg-amber-100 px-2 py-0.5 rounded-md inline-block mb-1">カット</span>
+                <h4 class="font-bold text-sm text-gray-800">カット＋マイクロバブル＋炭酸スパ</h4>
+                <p class="text-xs text-gray-500 mt-0.5">カット＋マイクロバブル＋スパ</p>
+                <div class="text-xs text-gray-400 mt-1"><i class="fa-regular fa-clock"></i> 所要時間: 約 75 分</div>
+              </div>
+            </div>
+            <div class="text-right font-bold text-slate-900 text-sm">
+              ¥7,900
+            </div>
+          </div>
+        
+          <div onclick="toggleMenuSelect(3)" class="p-4 rounded-2xl border transition cursor-pointer flex justify-between items-center border-gray-200 hover:border-amber-300 bg-white">
+            <div class="flex items-start gap-3">
+              <input type="checkbox" class="mt-1 w-4 h-4 accent-amber-500 rounded cursor-pointer">
+              <div>
+                <span class="text-[10px] font-bold text-amber-700 bg-amber-100 px-2 py-0.5 rounded-md inline-block mb-1">カット</span>
+                <h4 class="font-bold text-sm text-gray-800">カット＋マイクロバブル＋リンケージトリートメント</h4>
+                <p class="text-xs text-gray-500 mt-0.5">カット＋クレンジング＋トリートメントになります</p>
+                <div class="text-xs text-gray-400 mt-1"><i class="fa-regular fa-clock"></i> 所要時間: 約 75 分</div>
+              </div>
+            </div>
+            <div class="text-right font-bold text-slate-900 text-sm">
+              ¥8,900
+            </div>
+          </div>
+        
+          <div onclick="toggleMenuSelect(4)" class="p-4 rounded-2xl border transition cursor-pointer flex justify-between items-center border-gray-200 hover:border-amber-300 bg-white">
+            <div class="flex items-start gap-3">
+              <input type="checkbox" class="mt-1 w-4 h-4 accent-amber-500 rounded cursor-pointer">
+              <div>
+                <span class="text-[10px] font-bold text-amber-700 bg-amber-100 px-2 py-0.5 rounded-md inline-block mb-1">カット</span>
+                <h4 class="font-bold text-sm text-gray-800">カット＋マイクロバブル＋リンケージトリートメント＋炭酸スパ</h4>
+                <p class="text-xs text-gray-500 mt-0.5">カット＋クレンジング＋炭酸スパ＋トリートメントになります</p>
+                <div class="text-xs text-gray-400 mt-1"><i class="fa-regular fa-clock"></i> 所要時間: 約 90 分</div>
+              </div>
+            </div>
+            <div class="text-right font-bold text-slate-900 text-sm">
+              ¥10,400
+            </div>
+          </div>
+        
+          <div onclick="toggleMenuSelect(5)" class="p-4 rounded-2xl border transition cursor-pointer flex justify-between items-center border-gray-200 hover:border-amber-300 bg-white">
+            <div class="flex items-start gap-3">
+              <input type="checkbox" class="mt-1 w-4 h-4 accent-amber-500 rounded cursor-pointer">
+              <div>
+                <span class="text-[10px] font-bold text-amber-700 bg-amber-100 px-2 py-0.5 rounded-md inline-block mb-1">カット</span>
+                <h4 class="font-bold text-sm text-gray-800">カット＋頭皮ケアコース</h4>
+                <p class="text-xs text-gray-500 mt-0.5">カット＋マイクロバブル＋炭酸スパ＋頭皮用トリートメント＆シャンプー</p>
+                <div class="text-xs text-gray-400 mt-1"><i class="fa-regular fa-clock"></i> 所要時間: 約 75 分</div>
+              </div>
+            </div>
+            <div class="text-right font-bold text-slate-900 text-sm">
+              ¥8,400
+            </div>
+          </div>
+        
+          <div onclick="toggleMenuSelect(6)" class="p-4 rounded-2xl border transition cursor-pointer flex justify-between items-center border-gray-200 hover:border-amber-300 bg-white">
+            <div class="flex items-start gap-3">
+              <input type="checkbox" class="mt-1 w-4 h-4 accent-amber-500 rounded cursor-pointer">
+              <div>
+                <span class="text-[10px] font-bold text-amber-700 bg-amber-100 px-2 py-0.5 rounded-md inline-block mb-1">カット</span>
+                <h4 class="font-bold text-sm text-gray-800">カット＋リラクゼーションコース</h4>
+                <p class="text-xs text-gray-500 mt-0.5">カット＋炭酸スパ＋ツボ押しスパ（クイック）＋マイクロバブル</p>
+                <div class="text-xs text-gray-400 mt-1"><i class="fa-regular fa-clock"></i> 所要時間: 約 90 分</div>
+              </div>
+            </div>
+            <div class="text-right font-bold text-slate-900 text-sm">
+              ¥9,900
+            </div>
+          </div>
+        
+          <div onclick="toggleMenuSelect(7)" class="p-4 rounded-2xl border transition cursor-pointer flex justify-between items-center border-gray-200 hover:border-amber-300 bg-white">
+            <div class="flex items-start gap-3">
+              <input type="checkbox" class="mt-1 w-4 h-4 accent-amber-500 rounded cursor-pointer">
+              <div>
+                <span class="text-[10px] font-bold text-amber-700 bg-amber-100 px-2 py-0.5 rounded-md inline-block mb-1">カット</span>
+                <h4 class="font-bold text-sm text-gray-800">前髪カット</h4>
+                <p class="text-xs text-gray-500 mt-0.5">前髪のみのポイントカット</p>
+                <div class="text-xs text-gray-400 mt-1"><i class="fa-regular fa-clock"></i> 所要時間: 約 15 分</div>
+              </div>
+            </div>
+            <div class="text-right font-bold text-slate-900 text-sm">
+              ¥1,500
+            </div>
+          </div>
+        
+          <div onclick="toggleMenuSelect(8)" class="p-4 rounded-2xl border transition cursor-pointer flex justify-between items-center border-gray-200 hover:border-amber-300 bg-white">
+            <div class="flex items-start gap-3">
+              <input type="checkbox" class="mt-1 w-4 h-4 accent-amber-500 rounded cursor-pointer">
+              <div>
+                <span class="text-[10px] font-bold text-amber-700 bg-amber-100 px-2 py-0.5 rounded-md inline-block mb-1">カラー</span>
+                <h4 class="font-bold text-sm text-gray-800">カラー(SB、マイクロバブル込)</h4>
+                <p class="text-xs text-gray-500 mt-0.5">ブリーチ+2000円</p>
+                <div class="text-xs text-gray-400 mt-1"><i class="fa-regular fa-clock"></i> 所要時間: 約 90 分</div>
+              </div>
+            </div>
+            <div class="text-right font-bold text-slate-900 text-sm">
+              ¥9,400
+            </div>
+          </div>
+        
+          <div onclick="toggleMenuSelect(9)" class="p-4 rounded-2xl border transition cursor-pointer flex justify-between items-center border-gray-200 hover:border-amber-300 bg-white">
+            <div class="flex items-start gap-3">
+              <input type="checkbox" class="mt-1 w-4 h-4 accent-amber-500 rounded cursor-pointer">
+              <div>
+                <span class="text-[10px] font-bold text-amber-700 bg-amber-100 px-2 py-0.5 rounded-md inline-block mb-1">カラー</span>
+                <h4 class="font-bold text-sm text-gray-800">リタッチカラー(SB、マイクロバブル込み)</h4>
+                <p class="text-xs text-gray-500 mt-0.5">根元3cm前後</p>
+                <div class="text-xs text-gray-400 mt-1"><i class="fa-regular fa-clock"></i> 所要時間: 約 75 分</div>
+              </div>
+            </div>
+            <div class="text-right font-bold text-slate-900 text-sm">
+              ¥8,900
+            </div>
+          </div>
+        
+          <div onclick="toggleMenuSelect(10)" class="p-4 rounded-2xl border transition cursor-pointer flex justify-between items-center border-gray-200 hover:border-amber-300 bg-white">
+            <div class="flex items-start gap-3">
+              <input type="checkbox" class="mt-1 w-4 h-4 accent-amber-500 rounded cursor-pointer">
+              <div>
+                <span class="text-[10px] font-bold text-amber-700 bg-amber-100 px-2 py-0.5 rounded-md inline-block mb-1">カラー</span>
+                <h4 class="font-bold text-sm text-gray-800">カラー＋炭酸ヘッドスパ＋マイクロバブル</h4>
+                <p class="text-xs text-gray-500 mt-0.5">ブリーチを使う場合は+1100円から2200円</p>
+                <div class="text-xs text-gray-400 mt-1"><i class="fa-regular fa-clock"></i> 所要時間: 約 90 分</div>
+              </div>
+            </div>
+            <div class="text-right font-bold text-slate-900 text-sm">
+              ¥10,900
+            </div>
+          </div>
+        
+          <div onclick="toggleMenuSelect(11)" class="p-4 rounded-2xl border transition cursor-pointer flex justify-between items-center border-gray-200 hover:border-amber-300 bg-white">
+            <div class="flex items-start gap-3">
+              <input type="checkbox" class="mt-1 w-4 h-4 accent-amber-500 rounded cursor-pointer">
+              <div>
+                <span class="text-[10px] font-bold text-amber-700 bg-amber-100 px-2 py-0.5 rounded-md inline-block mb-1">カラー</span>
+                <h4 class="font-bold text-sm text-gray-800">カラー＋マイクロバブル＋リンケージトリートメント</h4>
+                <p class="text-xs text-gray-500 mt-0.5">ブリーチを使う場合は+1100円から2200円</p>
+                <div class="text-xs text-gray-400 mt-1"><i class="fa-regular fa-clock"></i> 所要時間: 約 90 分</div>
+              </div>
+            </div>
+            <div class="text-right font-bold text-slate-900 text-sm">
+              ¥12,400
+            </div>
+          </div>
+        
+          <div onclick="toggleMenuSelect(12)" class="p-4 rounded-2xl border transition cursor-pointer flex justify-between items-center border-gray-200 hover:border-amber-300 bg-white">
+            <div class="flex items-start gap-3">
+              <input type="checkbox" class="mt-1 w-4 h-4 accent-amber-500 rounded cursor-pointer">
+              <div>
+                <span class="text-[10px] font-bold text-amber-700 bg-amber-100 px-2 py-0.5 rounded-md inline-block mb-1">カラー</span>
+                <h4 class="font-bold text-sm text-gray-800">カラー＋炭酸ヘッドスパ＋リンケージバブルトリートメント＋マイクロバブル</h4>
+                <p class="text-xs text-gray-500 mt-0.5">ブリーチを使う場合は+1100円から2200円</p>
+                <div class="text-xs text-gray-400 mt-1"><i class="fa-regular fa-clock"></i> 所要時間: 約 105 分</div>
+              </div>
+            </div>
+            <div class="text-right font-bold text-slate-900 text-sm">
+              ¥13,900
+            </div>
+          </div>
+        
+          <div onclick="toggleMenuSelect(13)" class="p-4 rounded-2xl border transition cursor-pointer flex justify-between items-center border-gray-200 hover:border-amber-300 bg-white">
+            <div class="flex items-start gap-3">
+              <input type="checkbox" class="mt-1 w-4 h-4 accent-amber-500 rounded cursor-pointer">
+              <div>
+                <span class="text-[10px] font-bold text-amber-700 bg-amber-100 px-2 py-0.5 rounded-md inline-block mb-1">カラー</span>
+                <h4 class="font-bold text-sm text-gray-800">リタッチカラー(SB込み) ＋炭酸スパ＋マイクロバブル</h4>
+                <p class="text-xs text-gray-500 mt-0.5">リタッチカラー マイクロバブル 炭酸スパになります！およそ3cm目安とさせていただきます！</p>
+                <div class="text-xs text-gray-400 mt-1"><i class="fa-regular fa-clock"></i> 所要時間: 約 75 分</div>
+              </div>
+            </div>
+            <div class="text-right font-bold text-slate-900 text-sm">
+              ¥9,900
+            </div>
+          </div>
+        
+          <div onclick="toggleMenuSelect(14)" class="p-4 rounded-2xl border transition cursor-pointer flex justify-between items-center border-gray-200 hover:border-amber-300 bg-white">
+            <div class="flex items-start gap-3">
+              <input type="checkbox" class="mt-1 w-4 h-4 accent-amber-500 rounded cursor-pointer">
+              <div>
+                <span class="text-[10px] font-bold text-amber-700 bg-amber-100 px-2 py-0.5 rounded-md inline-block mb-1">カラー</span>
+                <h4 class="font-bold text-sm text-gray-800">リタッチカラー ＋リンケージトリートメント ＋マイクロバブル</h4>
+                <p class="text-xs text-gray-500 mt-0.5">リタッチカラー リンケージトリートメント マイクロバブル 炭酸スパ +660でホームケア</p>
+                <div class="text-xs text-gray-400 mt-1"><i class="fa-regular fa-clock"></i> 所要時間: 約 75 分</div>
+              </div>
+            </div>
+            <div class="text-right font-bold text-slate-900 text-sm">
+              ¥11,400
+            </div>
+          </div>
+        
+          <div onclick="toggleMenuSelect(15)" class="p-4 rounded-2xl border transition cursor-pointer flex justify-between items-center border-gray-200 hover:border-amber-300 bg-white">
+            <div class="flex items-start gap-3">
+              <input type="checkbox" class="mt-1 w-4 h-4 accent-amber-500 rounded cursor-pointer">
+              <div>
+                <span class="text-[10px] font-bold text-amber-700 bg-amber-100 px-2 py-0.5 rounded-md inline-block mb-1">カラー</span>
+                <h4 class="font-bold text-sm text-gray-800">カット＋カラー＋炭酸ヘッドスパ＋マイクロバブル</h4>
+                <p class="text-xs text-gray-500 mt-0.5">ダブルカラー特殊カラーは除きます +2000円でリンケージ +660円ホームケア</p>
+                <div class="text-xs text-gray-400 mt-1"><i class="fa-regular fa-clock"></i> 所要時間: 約 120 分</div>
+              </div>
+            </div>
+            <div class="text-right font-bold text-slate-900 text-sm">
+              ¥13,900
+            </div>
+          </div>
+        
+          <div onclick="toggleMenuSelect(16)" class="p-4 rounded-2xl border transition cursor-pointer flex justify-between items-center border-gray-200 hover:border-amber-300 bg-white">
+            <div class="flex items-start gap-3">
+              <input type="checkbox" class="mt-1 w-4 h-4 accent-amber-500 rounded cursor-pointer">
+              <div>
+                <span class="text-[10px] font-bold text-amber-700 bg-amber-100 px-2 py-0.5 rounded-md inline-block mb-1">カラー</span>
+                <h4 class="font-bold text-sm text-gray-800">カット＋カラー＋リンケージトリートメント＋マイクロバブル</h4>
+                <p class="text-xs text-gray-500 mt-0.5">ダブルカラー等は除きます ＋1500円で炭酸ヘッドスパ</p>
+                <div class="text-xs text-gray-400 mt-1"><i class="fa-regular fa-clock"></i> 所要時間: 約 135 分</div>
+              </div>
+            </div>
+            <div class="text-right font-bold text-slate-900 text-sm">
+              ¥15,400
+            </div>
+          </div>
+        
+          <div onclick="toggleMenuSelect(17)" class="p-4 rounded-2xl border transition cursor-pointer flex justify-between items-center border-gray-200 hover:border-amber-300 bg-white">
+            <div class="flex items-start gap-3">
+              <input type="checkbox" class="mt-1 w-4 h-4 accent-amber-500 rounded cursor-pointer">
+              <div>
+                <span class="text-[10px] font-bold text-amber-700 bg-amber-100 px-2 py-0.5 rounded-md inline-block mb-1">カラー</span>
+                <h4 class="font-bold text-sm text-gray-800">カット＋カラー＋炭酸ヘッドスパ＋リンケージトリートメント＋マイクロバブル</h4>
+                <p class="text-xs text-gray-500 mt-0.5">フルフルコースメニュー</p>
+                <div class="text-xs text-gray-400 mt-1"><i class="fa-regular fa-clock"></i> 所要時間: 約 150 分</div>
+              </div>
+            </div>
+            <div class="text-right font-bold text-slate-900 text-sm">
+              ¥16,900
+            </div>
+          </div>
+        
+          <div onclick="toggleMenuSelect(18)" class="p-4 rounded-2xl border transition cursor-pointer flex justify-between items-center border-gray-200 hover:border-amber-300 bg-white">
+            <div class="flex items-start gap-3">
+              <input type="checkbox" class="mt-1 w-4 h-4 accent-amber-500 rounded cursor-pointer">
+              <div>
+                <span class="text-[10px] font-bold text-amber-700 bg-amber-100 px-2 py-0.5 rounded-md inline-block mb-1">パーマ</span>
+                <h4 class="font-bold text-sm text-gray-800">パーマ(SB込)</h4>
+                <p class="text-xs text-gray-500 mt-0.5">パーマ単品メニュー</p>
+                <div class="text-xs text-gray-400 mt-1"><i class="fa-regular fa-clock"></i> 所要時間: 約 90 分</div>
+              </div>
+            </div>
+            <div class="text-right font-bold text-slate-900 text-sm">
+              ¥8,900
+            </div>
+          </div>
+        
+          <div onclick="toggleMenuSelect(19)" class="p-4 rounded-2xl border transition cursor-pointer flex justify-between items-center border-gray-200 hover:border-amber-300 bg-white">
+            <div class="flex items-start gap-3">
+              <input type="checkbox" class="mt-1 w-4 h-4 accent-amber-500 rounded cursor-pointer">
+              <div>
+                <span class="text-[10px] font-bold text-amber-700 bg-amber-100 px-2 py-0.5 rounded-md inline-block mb-1">パーマ</span>
+                <h4 class="font-bold text-sm text-gray-800">カット＋パーマ＋炭酸ヘッドスパ＋マイクロバブル</h4>
+                <p class="text-xs text-gray-500 mt-0.5">特殊パーマは除きます</p>
+                <div class="text-xs text-gray-400 mt-1"><i class="fa-regular fa-clock"></i> 所要時間: 約 120 分</div>
+              </div>
+            </div>
+            <div class="text-right font-bold text-slate-900 text-sm">
+              ¥13,900
+            </div>
+          </div>
+        
+          <div onclick="toggleMenuSelect(20)" class="p-4 rounded-2xl border transition cursor-pointer flex justify-between items-center border-gray-200 hover:border-amber-300 bg-white">
+            <div class="flex items-start gap-3">
+              <input type="checkbox" class="mt-1 w-4 h-4 accent-amber-500 rounded cursor-pointer">
+              <div>
+                <span class="text-[10px] font-bold text-amber-700 bg-amber-100 px-2 py-0.5 rounded-md inline-block mb-1">パーマ</span>
+                <h4 class="font-bold text-sm text-gray-800">カット＋パーマ＋リンケージトリートメント＋マイクロバブル</h4>
+                <p class="text-xs text-gray-500 mt-0.5">特殊パーマは除きます</p>
+                <div class="text-xs text-gray-400 mt-1"><i class="fa-regular fa-clock"></i> 所要時間: 約 135 分</div>
+              </div>
+            </div>
+            <div class="text-right font-bold text-slate-900 text-sm">
+              ¥15,400
+            </div>
+          </div>
+        
+          <div onclick="toggleMenuSelect(21)" class="p-4 rounded-2xl border transition cursor-pointer flex justify-between items-center border-gray-200 hover:border-amber-300 bg-white">
+            <div class="flex items-start gap-3">
+              <input type="checkbox" class="mt-1 w-4 h-4 accent-amber-500 rounded cursor-pointer">
+              <div>
+                <span class="text-[10px] font-bold text-amber-700 bg-amber-100 px-2 py-0.5 rounded-md inline-block mb-1">縮毛矯正</span>
+                <h4 class="font-bold text-sm text-gray-800">前髪縮毛矯正</h4>
+                <p class="text-xs text-gray-500 mt-0.5">前髪のみの縮毛矯正</p>
+                <div class="text-xs text-gray-400 mt-1"><i class="fa-regular fa-clock"></i> 所要時間: 約 90 分</div>
+              </div>
+            </div>
+            <div class="text-right font-bold text-slate-900 text-sm">
+              ¥9,900
+            </div>
+          </div>
+        
+          <div onclick="toggleMenuSelect(22)" class="p-4 rounded-2xl border transition cursor-pointer flex justify-between items-center border-gray-200 hover:border-amber-300 bg-white">
+            <div class="flex items-start gap-3">
+              <input type="checkbox" class="mt-1 w-4 h-4 accent-amber-500 rounded cursor-pointer">
+              <div>
+                <span class="text-[10px] font-bold text-amber-700 bg-amber-100 px-2 py-0.5 rounded-md inline-block mb-1">縮毛矯正</span>
+                <h4 class="font-bold text-sm text-gray-800">顔周り縮毛矯正</h4>
+                <p class="text-xs text-gray-500 mt-0.5">顔周りの縮毛矯正</p>
+                <div class="text-xs text-gray-400 mt-1"><i class="fa-regular fa-clock"></i> 所要時間: 約 105 分</div>
+              </div>
+            </div>
+            <div class="text-right font-bold text-slate-900 text-sm">
+              ¥12,900
+            </div>
+          </div>
+        
+          <div onclick="toggleMenuSelect(23)" class="p-4 rounded-2xl border transition cursor-pointer flex justify-between items-center border-gray-200 hover:border-amber-300 bg-white">
+            <div class="flex items-start gap-3">
+              <input type="checkbox" class="mt-1 w-4 h-4 accent-amber-500 rounded cursor-pointer">
+              <div>
+                <span class="text-[10px] font-bold text-amber-700 bg-amber-100 px-2 py-0.5 rounded-md inline-block mb-1">縮毛矯正</span>
+                <h4 class="font-bold text-sm text-gray-800">ハーフ縮毛矯正</h4>
+                <p class="text-xs text-gray-500 mt-0.5">範囲が全体の半分くらいの縮毛です</p>
+                <div class="text-xs text-gray-400 mt-1"><i class="fa-regular fa-clock"></i> 所要時間: 約 120 分</div>
+              </div>
+            </div>
+            <div class="text-right font-bold text-slate-900 text-sm">
+              ¥14,900
+            </div>
+          </div>
+        
+          <div onclick="toggleMenuSelect(24)" class="p-4 rounded-2xl border transition cursor-pointer flex justify-between items-center border-gray-200 hover:border-amber-300 bg-white">
+            <div class="flex items-start gap-3">
+              <input type="checkbox" class="mt-1 w-4 h-4 accent-amber-500 rounded cursor-pointer">
+              <div>
+                <span class="text-[10px] font-bold text-amber-700 bg-amber-100 px-2 py-0.5 rounded-md inline-block mb-1">縮毛矯正</span>
+                <h4 class="font-bold text-sm text-gray-800">縮毛矯正(SB込)</h4>
+                <p class="text-xs text-gray-500 mt-0.5">全頭縮毛矯正</p>
+                <div class="text-xs text-gray-400 mt-1"><i class="fa-regular fa-clock"></i> 所要時間: 約 150 分</div>
+              </div>
+            </div>
+            <div class="text-right font-bold text-slate-900 text-sm">
+              ¥17,900
+            </div>
+          </div>
+        
+          <div onclick="toggleMenuSelect(25)" class="p-4 rounded-2xl border transition cursor-pointer flex justify-between items-center border-gray-200 hover:border-amber-300 bg-white">
+            <div class="flex items-start gap-3">
+              <input type="checkbox" class="mt-1 w-4 h-4 accent-amber-500 rounded cursor-pointer">
+              <div>
+                <span class="text-[10px] font-bold text-amber-700 bg-amber-100 px-2 py-0.5 rounded-md inline-block mb-1">縮毛矯正</span>
+                <h4 class="font-bold text-sm text-gray-800">カット＋縮毛矯正＋ヘッドスパ＋マイクロバブル</h4>
+                <p class="text-xs text-gray-500 mt-0.5">フルコース縮毛矯正</p>
+                <div class="text-xs text-gray-400 mt-1"><i class="fa-regular fa-clock"></i> 所要時間: 約 180 分</div>
+              </div>
+            </div>
+            <div class="text-right font-bold text-slate-900 text-sm">
+              ¥23,900
+            </div>
+          </div>
+        
+          <div onclick="toggleMenuSelect(26)" class="p-4 rounded-2xl border transition cursor-pointer flex justify-between items-center border-gray-200 hover:border-amber-300 bg-white">
+            <div class="flex items-start gap-3">
+              <input type="checkbox" class="mt-1 w-4 h-4 accent-amber-500 rounded cursor-pointer">
+              <div>
+                <span class="text-[10px] font-bold text-amber-700 bg-amber-100 px-2 py-0.5 rounded-md inline-block mb-1">縮毛矯正</span>
+                <h4 class="font-bold text-sm text-gray-800">カット＋縮毛矯正＋リンケージトリートメント＋マイクロバブル</h4>
+                <p class="text-xs text-gray-500 mt-0.5">トリートメント付縮毛矯正</p>
+                <div class="text-xs text-gray-400 mt-1"><i class="fa-regular fa-clock"></i> 所要時間: 約 195 分</div>
+              </div>
+            </div>
+            <div class="text-right font-bold text-slate-900 text-sm">
+              ¥25,400
+            </div>
+          </div>
+        
+          <div onclick="toggleMenuSelect(27)" class="p-4 rounded-2xl border transition cursor-pointer flex justify-between items-center border-gray-200 hover:border-amber-300 bg-white">
+            <div class="flex items-start gap-3">
+              <input type="checkbox" class="mt-1 w-4 h-4 accent-amber-500 rounded cursor-pointer">
+              <div>
+                <span class="text-[10px] font-bold text-amber-700 bg-amber-100 px-2 py-0.5 rounded-md inline-block mb-1">縮毛矯正</span>
+                <h4 class="font-bold text-sm text-gray-800">カット＋縮毛矯正＋炭酸ヘッドスパ＋トリートメント＋マイクロバブル</h4>
+                <p class="text-xs text-gray-500 mt-0.5">プレミアム縮毛矯正コース</p>
+                <div class="text-xs text-gray-400 mt-1"><i class="fa-regular fa-clock"></i> 所要時間: 約 210 分</div>
+              </div>
+            </div>
+            <div class="text-right font-bold text-slate-900 text-sm">
+              ¥26,900
+            </div>
+          </div>
+        
+          <div onclick="toggleMenuSelect(28)" class="p-4 rounded-2xl border transition cursor-pointer flex justify-between items-center border-gray-200 hover:border-amber-300 bg-white">
+            <div class="flex items-start gap-3">
+              <input type="checkbox" class="mt-1 w-4 h-4 accent-amber-500 rounded cursor-pointer">
+              <div>
+                <span class="text-[10px] font-bold text-amber-700 bg-amber-100 px-2 py-0.5 rounded-md inline-block mb-1">トリートメント</span>
+                <h4 class="font-bold text-sm text-gray-800">リンケージ トリートメント ※SB別になります</h4>
+                <p class="text-xs text-gray-500 mt-0.5">ホームケア付き</p>
+                <div class="text-xs text-gray-400 mt-1"><i class="fa-regular fa-clock"></i> 所要時間: 約 30 分</div>
+              </div>
+            </div>
+            <div class="text-right font-bold text-slate-900 text-sm">
+              ¥4,400
+            </div>
+          </div>
+        
+          <div onclick="toggleMenuSelect(29)" class="p-4 rounded-2xl border transition cursor-pointer flex justify-between items-center border-gray-200 hover:border-amber-300 bg-white">
+            <div class="flex items-start gap-3">
+              <input type="checkbox" class="mt-1 w-4 h-4 accent-amber-500 rounded cursor-pointer">
+              <div>
+                <span class="text-[10px] font-bold text-amber-700 bg-amber-100 px-2 py-0.5 rounded-md inline-block mb-1">スパ・その他</span>
+                <h4 class="font-bold text-sm text-gray-800">ヘッドスパ(ツボ押しタイプ)SB込み</h4>
+                <p class="text-xs text-gray-500 mt-0.5">ツボ押しスパ</p>
+                <div class="text-xs text-gray-400 mt-1"><i class="fa-regular fa-clock"></i> 所要時間: 約 45 分</div>
+              </div>
+            </div>
+            <div class="text-right font-bold text-slate-900 text-sm">
+              ¥6,200
+            </div>
+          </div>
+        
+          <div onclick="toggleMenuSelect(30)" class="p-4 rounded-2xl border transition cursor-pointer flex justify-between items-center border-gray-200 hover:border-amber-300 bg-white">
+            <div class="flex items-start gap-3">
+              <input type="checkbox" class="mt-1 w-4 h-4 accent-amber-500 rounded cursor-pointer">
+              <div>
+                <span class="text-[10px] font-bold text-amber-700 bg-amber-100 px-2 py-0.5 rounded-md inline-block mb-1">スパ・その他</span>
+                <h4 class="font-bold text-sm text-gray-800">シャンプーブロー</h4>
+                <p class="text-xs text-gray-500 mt-0.5">シャンプー＆ブロー</p>
+                <div class="text-xs text-gray-400 mt-1"><i class="fa-regular fa-clock"></i> 所要時間: 約 30 分</div>
+              </div>
+            </div>
+            <div class="text-right font-bold text-slate-900 text-sm">
+              ¥3,900
+            </div>
+          </div>
+        </div>
+
+        <!-- 小計・時間合計 -->
+        <div class="mt-4 pt-4 border-t flex justify-between items-center bg-amber-50/50 p-4 rounded-2xl">
+          <div>
+            <span class="text-xs text-gray-600">選択中: <strong id="selected-count">0</strong> 件</span>
+            <div class="text-xs text-gray-700 font-bold mt-0.5">合計所要時間: 約 <span id="total-time" class="text-amber-600 font-bold">0</span> 分</div>
+          </div>
+          <div class="text-right">
+            <span class="text-xs text-gray-500">合計金額</span>
+            <div class="text-xl font-bold text-amber-600">¥<span id="total-price">0</span></div>
+          </div>
+        </div>
+
+        <button type="button" id="to-calendar-btn" onclick="openCalendarModal()" disabled="" class="w-full mt-4 py-4 bg-gray-200 text-gray-400 font-bold rounded-2xl text-base transition cursor-not-allowed shadow-sm">📅 日付を選ぶ (先に上のメニューにチェックを入れてください)</button>
+      </div>
+
+      <!-- STEP 4: お客様情報入力 -->
+      <div id="booking-step4-container" class="bg-white rounded-3xl p-5 shadow-sm border border-gray-200 mb-6 hidden">
+        <h3 class="font-bold text-gray-800 mb-4 pb-2 border-b flex items-center gap-2">
+          <span class="w-6 h-6 rounded-full bg-amber-500 text-slate-900 text-xs flex items-center justify-center font-bold">✓</span>
+          お客様情報の入力・予約確定
+        </h3>
+
+        <form id="booking-form" onsubmit="submitBooking(event)" class="space-y-4">
+          <div class="p-4 bg-amber-50 rounded-2xl border border-amber-200 mb-4 text-xs">
+            <div class="font-bold text-gray-700 mb-1">選択中のご予約内容</div>
+            <div id="display-selected-summary" class="text-amber-700 font-bold text-sm">日時未選択</div>
+            <button type="button" onclick="openCalendarModal()" class="mt-2 text-xs text-amber-600 underline font-bold block cursor-pointer">日時を変更する</button>
+          </div>
+
+          <div>
+            <label class="block text-xs font-bold text-gray-700 mb-1">お名前（フルネーム）</label>
+            <input type="text" id="book-name" required="" placeholder="山田 太郎" class="w-full p-3 border rounded-xl text-sm bg-gray-50">
+          </div>
+          <div>
+            <label class="block text-xs font-bold text-gray-700 mb-1">お電話番号</label>
+            <input type="tel" id="book-phone" required="" placeholder="09012345678" class="w-full p-3 border rounded-xl text-sm bg-gray-50">
+          </div>
+          <div>
+            <label class="block text-xs font-bold text-gray-700 mb-1">メールアドレス</label>
+            <input type="email" id="book-email" required="" placeholder="example@email.com" class="w-full p-3 border rounded-xl text-sm bg-gray-50">
+          </div>
+          <div>
+            <label class="block text-xs font-bold text-gray-700 mb-1">ご要望・備考（任意）</label>
+            <textarea id="book-note" maxlength="300" rows="3" placeholder="例：初めてです／前回と同じ仕上がりで／アレルギーがあります" class="w-full p-3 border rounded-xl text-sm bg-gray-50"></textarea>
+          </div>
+          <button type="submit" class="w-full py-4 bg-amber-500 hover:bg-amber-600 text-slate-900 font-bold rounded-2xl shadow-md text-sm transition cursor-pointer">
+            予約を確定する
+          </button>
+        </form>
+      </div>
+    </div>
+
+    <!-- TAB 3: お客様用 予約確認・キャンセル画面 -->
+    <div id="tab-cancel" class="tab-content hidden" style="display: none;">
+      <div class="bg-white rounded-3xl p-6 shadow-sm border border-gray-200">
+        <div class="text-center mb-6">
+          <div class="w-12 h-12 bg-red-100 text-red-500 rounded-full flex items-center justify-center mx-auto mb-2 text-xl">
+            <i class="fa-solid fa-calendar-xmark"></i>
+          </div>
+          <h2 class="text-lg font-bold text-gray-800">ご予約の確認・キャンセル</h2>
+          <p class="text-xs text-gray-500 mt-1">ご予約完了時にお知らせした「予約コード」（12文字）を入力してください。</p>
+        </div>
+
+        <form onsubmit="searchCustomerBooking(event)" class="space-y-4 max-w-md mx-auto bg-gray-50 p-5 rounded-2xl border">
+          <div>
+            <label class="block text-xs font-bold text-gray-700 mb-1">予約コード</label>
+            <input type="text" id="cancel-search-code" required="" placeholder="例: ABCD-EFGH-JKLM" class="w-full p-3 border rounded-xl text-sm bg-white uppercase">
+          </div>
+          <button type="submit" class="w-full py-3.5 bg-slate-900 hover:bg-slate-800 text-white font-bold rounded-xl text-sm transition shadow cursor-pointer">
+            🔍 予約を検索する
+          </button>
+        </form>
+
+        <div id="cancel-result-container" class="mt-6 hidden">
+          <h3 class="font-bold text-sm text-gray-800 mb-3 border-b pb-2">該当するご予約</h3>
+          <div id="cancel-booking-list" class="space-y-3"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- TAB 2: 店舗管理画面（初期は hidden で隠す） -->
+    <div id="tab-admin" class="tab-content" style="display: block;">
+      <div class="bg-slate-900 text-white rounded-3xl p-5 shadow-md mb-6 flex justify-between items-center flex-wrap gap-3">
+        <div>
+          <span class="text-xs bg-amber-500 text-slate-900 px-2 py-0.5 rounded font-bold">OWNER CONSOLE</span>
+          <h2 class="text-lg font-bold mt-1">RHP hair design 店舗管理</h2>
+        </div>
+        <div class="flex gap-2">
+          <button type="button" onclick="copySourceCode()" class="px-3 py-1.5 bg-amber-500 text-slate-900 font-bold text-xs rounded-xl hover:bg-amber-400 flex items-center gap-1 shadow cursor-pointer">
+            <i class="fa-solid fa-copy"></i> プログラムをコピー
+          </button>
+          <button type="button" onclick="logoutAdmin()" class="px-3 py-1.5 bg-slate-800 text-xs rounded-xl border border-slate-700 hover:bg-slate-700 text-white cursor-pointer">
+            🔒 ログアウト
+          </button>
+        </div>
+      </div>
+
+      <div class="space-y-6">
+        <!-- ホーム画面文章・設定の編集 -->
+        <div class="bg-white rounded-3xl p-5 shadow-sm border">
+          <h3 class="font-bold text-gray-800 mb-4 flex items-center gap-2">
+            <i class="fa-solid fa-pen-to-square text-amber-600"></i> トップ画面の文章・キャッチコピーの編集
+          </h3>
+          <form onsubmit="saveHeroSettings(event)" class="space-y-3 text-xs">
+            <div>
+              <label class="block font-bold text-gray-700 mb-1">上部タグ（例: 完全マンツーマン施術）</label>
+              <input type="text" id="hero-edit-tag" class="w-full p-2.5 border rounded-xl bg-gray-50" required="">
+            </div>
+            <div>
+              <label class="block font-bold text-gray-700 mb-1">メインタイトル</label>
+              <input type="text" id="hero-edit-title" class="w-full p-2.5 border rounded-xl bg-gray-50" required="">
+            </div>
+            <div>
+              <label class="block font-bold text-gray-700 mb-1">説明文</label>
+              <textarea id="hero-edit-desc" rows="3" class="w-full p-2.5 border rounded-xl bg-gray-50" required=""></textarea>
+            </div>
+            <button type="submit" class="w-full py-2.5 bg-amber-500 hover:bg-amber-600 text-slate-900 font-bold rounded-xl shadow transition cursor-pointer">
+              ✓ トップ文章を保存・更新
+            </button>
+          </form>
+        </div>
+
+        <!-- ご予約一覧・確認メール作成 -->
+        <div class="bg-white rounded-3xl p-5 shadow-sm border">
+          <div class="flex justify-between items-center mb-4 flex-wrap gap-2">
+            <h3 class="font-bold text-gray-800 flex items-center gap-2">
+              <i class="fa-solid fa-calendar-check text-amber-600"></i> ご予約一覧・一週間分リマインドメール作成
+            </h3>
+            <button type="button" onclick="downloadCSV()" class="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-white text-xs font-bold rounded-xl flex items-center gap-1 shadow cursor-pointer">
+              <i class="fa-solid fa-file-csv text-amber-400"></i> CSV出力
+            </button>
+          </div>
+
+          <!-- 一週間分一括メール作成機能 -->
+          <div class="bg-amber-50/70 p-4 rounded-2xl border border-amber-200 mb-4 space-y-3 text-xs">
+            <div class="font-bold text-amber-900 flex items-center gap-1.5">
+              <i class="fa-solid fa-paper-plane text-amber-600"></i> 直近1週間のご予約者への一括・個別メール文面ジェネレーター
+            </div>
+            <p class="text-gray-600">直近1週間の予約者リストを表示し、任意の文面にカスタマイズしてLINEやメールで送信できます。</p>
+            <div>
+              <label class="block font-bold text-gray-700 mb-1">メール・LINE送信文面のテンプレート（自由に編集可能）</label>
+              <textarea id="email-template-textarea" rows="4" class="w-full p-3 bg-white border rounded-xl text-xs leading-relaxed">【RHP hair design よりご予約確認のお知らせ】
+{name} 様
+
+いつもRHP hair designをご利用いただき誠にありがとうございます。
+以下の内容でご予約を承っております。
+
+■ 予約日時: {date} {time}〜
+■ メニュー: {menu}
+■ 予約ID: #{id}
+
+ご変更やキャンセルの場合は、お早めにご連絡ください。
+ご来店を心よりお待ちしております。</textarea>
+            </div>
+            <button type="button" onclick="generateWeeklyReminderList()" class="w-full py-2.5 bg-amber-500 hover:bg-amber-600 text-slate-900 font-bold rounded-xl shadow cursor-pointer">
+              📅 直近1週間の予約者をリストアップして文面を作成する
+            </button>
+          </div>
+          <div id="weekly-reminder-output" class="space-y-3 mb-6 hidden"></div>
+
+          <div id="admin-calendar" class="mb-5"><div class="bg-white border rounded-2xl p-3 shadow-sm">
+        <div class="flex items-center justify-between mb-2">
+          <button type="button" onclick="changeCalMonth(-1)" class="w-10 h-10 rounded-xl bg-gray-100 font-bold cursor-pointer">‹</button>
+          <div class="font-bold text-sm">2026年11月</div>
+          <button type="button" onclick="changeCalMonth(1)" class="w-10 h-10 rounded-xl bg-gray-100 font-bold cursor-pointer">›</button>
+        </div>
+        <div class="grid grid-cols-7 text-center text-[10px] font-bold text-gray-500 mb-1"><div class="text-red-500">日</div><div class="">月</div><div class="">火</div><div class="">水</div><div class="">木</div><div class="">金</div><div class="text-blue-500">土</div></div>
+        <div class="grid grid-cols-7 gap-1"><button type="button" onclick="selectCalDay('2026-11-01')" class="h-12 border rounded-xl text-xs font-bold flex flex-col items-center justify-center cursor-pointer bg-white "><span>1</span></button><button type="button" onclick="selectCalDay('2026-11-02')" class="h-12 border rounded-xl text-xs font-bold flex flex-col items-center justify-center cursor-pointer bg-gray-100 text-gray-400 "><span>2</span><span class="text-[9px]">休</span></button><button type="button" onclick="selectCalDay('2026-11-03')" class="h-12 border rounded-xl text-xs font-bold flex flex-col items-center justify-center cursor-pointer bg-gray-100 text-gray-400 "><span>3</span><span class="text-[9px]">休</span></button><button type="button" onclick="selectCalDay('2026-11-04')" class="h-12 border rounded-xl text-xs font-bold flex flex-col items-center justify-center cursor-pointer bg-white "><span>4</span></button><button type="button" onclick="selectCalDay('2026-11-05')" class="h-12 border rounded-xl text-xs font-bold flex flex-col items-center justify-center cursor-pointer bg-white "><span>5</span></button><button type="button" onclick="selectCalDay('2026-11-06')" class="h-12 border rounded-xl text-xs font-bold flex flex-col items-center justify-center cursor-pointer bg-white "><span>6</span></button><button type="button" onclick="selectCalDay('2026-11-07')" class="h-12 border rounded-xl text-xs font-bold flex flex-col items-center justify-center cursor-pointer bg-white "><span>7</span></button><button type="button" onclick="selectCalDay('2026-11-08')" class="h-12 border rounded-xl text-xs font-bold flex flex-col items-center justify-center cursor-pointer bg-white "><span>8</span></button><button type="button" onclick="selectCalDay('2026-11-09')" class="h-12 border rounded-xl text-xs font-bold flex flex-col items-center justify-center cursor-pointer bg-gray-100 text-gray-400 "><span>9</span><span class="text-[9px]">休</span></button><button type="button" onclick="selectCalDay('2026-11-10')" class="h-12 border rounded-xl text-xs font-bold flex flex-col items-center justify-center cursor-pointer bg-gray-100 text-gray-400 "><span>10</span><span class="text-[9px]">休</span></button><button type="button" onclick="selectCalDay('2026-11-11')" class="h-12 border rounded-xl text-xs font-bold flex flex-col items-center justify-center cursor-pointer bg-white "><span>11</span></button><button type="button" onclick="selectCalDay('2026-11-12')" class="h-12 border rounded-xl text-xs font-bold flex flex-col items-center justify-center cursor-pointer bg-white "><span>12</span></button><button type="button" onclick="selectCalDay('2026-11-13')" class="h-12 border rounded-xl text-xs font-bold flex flex-col items-center justify-center cursor-pointer bg-white "><span>13</span></button><button type="button" onclick="selectCalDay('2026-11-14')" class="h-12 border rounded-xl text-xs font-bold flex flex-col items-center justify-center cursor-pointer bg-white "><span>14</span></button><button type="button" onclick="selectCalDay('2026-11-15')" class="h-12 border rounded-xl text-xs font-bold flex flex-col items-center justify-center cursor-pointer bg-white "><span>15</span></button><button type="button" onclick="selectCalDay('2026-11-16')" class="h-12 border rounded-xl text-xs font-bold flex flex-col items-center justify-center cursor-pointer bg-gray-100 text-gray-400 "><span>16</span><span class="text-[9px]">休</span></button><button type="button" onclick="selectCalDay('2026-11-17')" class="h-12 border rounded-xl text-xs font-bold flex flex-col items-center justify-center cursor-pointer bg-gray-100 text-gray-400 "><span>17</span><span class="text-[9px]">休</span></button><button type="button" onclick="selectCalDay('2026-11-18')" class="h-12 border rounded-xl text-xs font-bold flex flex-col items-center justify-center cursor-pointer bg-white "><span>18</span></button><button type="button" onclick="selectCalDay('2026-11-19')" class="h-12 border rounded-xl text-xs font-bold flex flex-col items-center justify-center cursor-pointer bg-white "><span>19</span></button><button type="button" onclick="selectCalDay('2026-11-20')" class="h-12 border rounded-xl text-xs font-bold flex flex-col items-center justify-center cursor-pointer bg-white "><span>20</span></button><button type="button" onclick="selectCalDay('2026-11-21')" class="h-12 border rounded-xl text-xs font-bold flex flex-col items-center justify-center cursor-pointer bg-white "><span>21</span></button><button type="button" onclick="selectCalDay('2026-11-22')" class="h-12 border rounded-xl text-xs font-bold flex flex-col items-center justify-center cursor-pointer bg-white "><span>22</span></button><button type="button" onclick="selectCalDay('2026-11-23')" class="h-12 border rounded-xl text-xs font-bold flex flex-col items-center justify-center cursor-pointer bg-amber-400 border-amber-500 text-slate-900 ring-2 ring-slate-900"><span>23</span><span class="text-[9px]">休</span></button><button type="button" onclick="selectCalDay('2026-11-24')" class="h-12 border rounded-xl text-xs font-bold flex flex-col items-center justify-center cursor-pointer bg-gray-100 text-gray-400 "><span>24</span><span class="text-[9px]">休</span></button><button type="button" onclick="selectCalDay('2026-11-25')" class="h-12 border rounded-xl text-xs font-bold flex flex-col items-center justify-center cursor-pointer bg-white "><span>25</span></button><button type="button" onclick="selectCalDay('2026-11-26')" class="h-12 border rounded-xl text-xs font-bold flex flex-col items-center justify-center cursor-pointer bg-white "><span>26</span></button><button type="button" onclick="selectCalDay('2026-11-27')" class="h-12 border rounded-xl text-xs font-bold flex flex-col items-center justify-center cursor-pointer bg-white "><span>27</span></button><button type="button" onclick="selectCalDay('2026-11-28')" class="h-12 border rounded-xl text-xs font-bold flex flex-col items-center justify-center cursor-pointer bg-white "><span>28</span></button><button type="button" onclick="selectCalDay('2026-11-29')" class="h-12 border rounded-xl text-xs font-bold flex flex-col items-center justify-center cursor-pointer bg-white "><span>29</span></button><button type="button" onclick="selectCalDay('2026-11-30')" class="h-12 border rounded-xl text-xs font-bold flex flex-col items-center justify-center cursor-pointer bg-gray-100 text-gray-400 "><span>30</span><span class="text-[9px]">休</span></button></div></div><div class="mt-3 bg-white border rounded-2xl p-3 shadow-sm"><div class="font-bold text-sm mb-1">2026-11-23 のご予約（休業日）</div><div class="flex flex-wrap gap-1.5 mb-2"><button type="button" onclick="openDay('2026-11-23')" class="shrink-0 px-2.5 py-1.5 font-bold rounded-lg cursor-pointer bg-emerald-600 text-white">営業日にする</button></div><p class="text-[10px] text-gray-500 mb-2">ホットペッパー等で埋まった時間は「消し込み」を押すと、こちらの予約画面でも埋まります。</p><div class="space-y-1.5"></div></div></div>
+
+          <div class="bg-slate-50 p-3.5 rounded-2xl border mb-4 space-y-3 text-xs">
+            <div class="flex items-center gap-2 flex-wrap">
+              <span class="font-bold text-gray-700"><i class="fa-solid fa-filter text-amber-500"></i> 表示期間:</span>
+              <button type="button" onclick="filterReservationsByPeriod('all')" id="btn-filter-all" class="px-2.5 py-1 rounded-lg font-bold bg-amber-500 text-slate-900 shadow-sm cursor-pointer">すべて</button>
+              <button type="button" onclick="filterReservationsByPeriod('today')" id="btn-filter-today" class="px-2.5 py-1 rounded-lg font-bold bg-white text-gray-700 border hover:bg-gray-100 cursor-pointer">本日</button>
+              <button type="button" onclick="filterReservationsByPeriod('week')" id="btn-filter-week" class="px-2.5 py-1 rounded-lg font-bold bg-white text-gray-700 border hover:bg-gray-100 cursor-pointer">直近1週間</button>
+            </div>
+            <div class="flex items-center gap-2">
+              <div class="relative flex-1">
+                <i class="fa-solid fa-magnifying-glass absolute left-3 top-2.5 text-gray-400"></i>
+                <input type="text" id="admin-res-search" oninput="renderReservations()" placeholder="お名前・お電話番号・予約IDで即時検索..." class="w-full pl-8 pr-3 py-2 bg-white border rounded-xl text-xs">
+              </div>
+            </div>
+          </div>
+
+          <div id="admin-reservation-list" class="space-y-3"><p class="text-xs text-gray-400 py-3 text-center">現在該当するご予約データはありません。</p></div>
+        </div>
+
+        <!-- ダッシュボード -->
+        <div class="bg-white rounded-3xl p-5 shadow-sm border">
+          <h3 class="font-bold text-gray-800 mb-4 flex items-center gap-2">
+            <i class="fa-solid fa-chart-line text-amber-600"></i> 今月の売上・予約状況ダッシュボード
+          </h3>
+          <div class="grid grid-cols-3 gap-3 text-center">
+            <div class="p-3 bg-amber-50 rounded-2xl border border-amber-200">
+              <span class="text-[10px] text-gray-500 block font-bold">総予約件数</span>
+              <span id="dash-res-count" class="text-lg font-bold text-slate-900">0件</span>
+            </div>
+            <div class="p-3 bg-emerald-50 rounded-2xl border border-emerald-200">
+              <span class="text-[10px] text-gray-500 block font-bold">見込み売上</span>
+              <span id="dash-sales-total" class="text-lg font-bold text-emerald-700">¥0</span>
+            </div>
+            <div class="p-3 bg-blue-50 rounded-2xl border border-blue-200">
+              <span class="text-[10px] text-gray-500 block font-bold">登録顧客数</span>
+              <span id="dash-customer-count" class="text-lg font-bold text-blue-700">0人</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- 電子カルテ -->
+        <div class="bg-white rounded-3xl p-5 shadow-sm border">
+          <h3 class="font-bold text-gray-800 mb-4 flex items-center gap-2">
+            <i class="fa-solid fa-address-card text-amber-600"></i> 顧客電子カルテ（メモ・施術履歴）
+          </h3>
+          <form id="karte-form" onsubmit="saveCustomerKarte(event)" class="space-y-3 text-xs mb-4 pb-4 border-b">
+            <div class="grid grid-cols-2 gap-2">
+              <div>
+                <label class="block font-bold text-gray-600 mb-1">お名前</label>
+                <input type="text" id="karte-name" required="" placeholder="例: 山田 太郎" class="w-full p-2.5 border rounded-xl bg-gray-50">
+              </div>
+              <div>
+                <label class="block font-bold text-gray-600 mb-1">お電話番号</label>
+                <input type="tel" id="karte-phone" required="" placeholder="例: 09012345678" class="w-full p-2.5 border rounded-xl bg-gray-50">
+              </div>
+            </div>
+            <div>
+              <label class="block font-bold text-gray-600 mb-1">髪質メモ・施術レシピ・会話メモ</label>
+              <textarea id="karte-memo" required="" rows="2" placeholder="例: カラー配合 N-8:A-8 (1:1)" class="w-full p-2.5 border rounded-xl bg-gray-50"></textarea>
+            </div>
+            <button type="submit" class="w-full py-2.5 bg-amber-500 hover:bg-amber-600 text-slate-900 font-bold rounded-xl shadow transition cursor-pointer">
+              ＋ カルテを保存・更新
+            </button>
+          </form>
+          <div id="karte-list" class="space-y-2 max-h-48 overflow-y-auto"><p class="text-xs text-gray-400">登録されたカルテはありません。</p></div>
+        </div>
+
+        <!-- 店舗からのお知らせ設定 -->
+        <div class="bg-white rounded-3xl p-5 shadow-sm border">
+          <h3 class="font-bold text-gray-800 mb-3 flex items-center gap-2">
+            <i class="fa-solid fa-bullhorn text-amber-600"></i> 店舗お知らせニュースの作成・編集・消去
+          </h3>
+          <form onsubmit="saveNewsSettings(event)" class="space-y-3 text-xs">
+            <div class="flex items-center gap-2 mb-2">
+              <input type="checkbox" id="news-edit-active" class="w-4 h-4 accent-amber-500 rounded cursor-pointer">
+              <label for="news-edit-active" class="font-bold text-gray-800 cursor-pointer">お知らせバナーをトップ画面に表示する</label>
+            </div>
+            <div class="grid grid-cols-3 gap-2">
+              <div>
+                <label class="block font-bold text-gray-700 mb-1">掲載日付</label>
+                <input type="text" id="news-edit-date" placeholder="2026/11/01" class="w-full p-2.5 border rounded-xl bg-gray-50">
+              </div>
+              <div class="col-span-2">
+                <label class="block font-bold text-gray-700 mb-1">見出し・タイトル</label>
+                <input type="text" id="news-edit-title" placeholder="例: 年末年始の営業スケジュールについて" class="w-full p-2.5 border rounded-xl bg-gray-50">
+              </div>
+            </div>
+            <div>
+              <label class="block font-bold text-gray-700 mb-1">お知らせ内容本文</label>
+              <textarea id="news-edit-content" rows="3" placeholder="お知らせの詳細テキストを入力してください..." class="w-full p-2.5 border rounded-xl bg-gray-50"></textarea>
+            </div>
+            <div class="flex gap-2">
+              <button type="submit" class="flex-1 py-2.5 bg-amber-500 hover:bg-amber-600 text-slate-900 font-bold rounded-xl shadow transition cursor-pointer">
+                ✓ お知らせを保存・更新
+              </button>
+              <button type="button" onclick="clearNewsSettings()" class="px-4 py-2.5 bg-red-100 text-red-600 hover:bg-red-200 font-bold rounded-xl transition cursor-pointer">
+                削除（消去）
+              </button>
+            </div>
+          </form>
+        </div>
+
+        <!-- 予約の受付ルール -->
+        <div class="bg-white rounded-3xl p-5 shadow-sm border">
+          <h3 class="font-bold text-gray-800 mb-3 flex items-center gap-2">
+            <i class="fa-solid fa-sliders text-amber-600"></i> 予約の受付ルール <span class="text-[10px] font-normal text-gray-400">（版 11/23-e）</span>
+          </h3>
+          <form onsubmit="saveBookingSettings(event)" class="space-y-3 text-xs">
+            <div>
+              <label class="block font-bold text-gray-700 mb-1">予約できる時間（開始時刻をカンマで区切る）</label>
+              <input type="text" id="set-times" class="w-full p-2.5 border rounded-xl bg-gray-50" placeholder="09:30, 11:00, 13:00, 15:00, 17:00, 19:00">
+            </div>
+            <div class="grid grid-cols-3 gap-2">
+              <div><label class="block font-bold text-gray-700 mb-1">何日後から</label><input type="number" id="set-min" min="0" max="60" class="w-full p-2.5 border rounded-xl bg-gray-50"></div>
+              <div><label class="block font-bold text-gray-700 mb-1">何日先まで</label><input type="number" id="set-max" min="1" max="400" class="w-full p-2.5 border rounded-xl bg-gray-50"></div>
+              <div><label class="block font-bold text-gray-700 mb-1">変更・取消は何日前まで</label><input type="number" id="set-cancel" min="0" max="30" class="w-full p-2.5 border rounded-xl bg-gray-50"></div>
+            </div>
+            <p class="text-gray-500">例：「何日先まで」を120にすると約4か月先まで受付します。0日後＝当日の予約も可、1日後＝明日から。</p>
+            <button type="submit" class="w-full py-2.5 bg-amber-500 hover:bg-amber-600 text-slate-900 font-bold rounded-xl shadow cursor-pointer">受付ルールを保存</button>
+          </form>
+        </div>
+
+        <!-- 臨時休業日・定休日の設定 -->
+        <div class="bg-white rounded-3xl p-5 shadow-sm border">
+          <h3 class="font-bold text-gray-800 mb-3 flex items-center gap-2">
+            <i class="fa-solid fa-calendar-minus text-amber-600"></i> 臨時休業日・休業日の管理
+          </h3>
+          <div class="space-y-3 text-xs">
+            <div class="flex gap-2">
+              <input type="date" id="custom-holiday-input" class="p-2.5 border rounded-xl bg-gray-50 text-xs flex-1">
+              <button type="button" onclick="addCustomHoliday()" class="px-4 py-2.5 bg-amber-500 hover:bg-amber-600 text-slate-900 font-bold rounded-xl shadow cursor-pointer">
+                ＋ 休業日を追加
+              </button>
+            </div>
+            <div id="custom-holiday-list" class="flex flex-wrap gap-2 pt-2"></div>
+          </div>
+        </div>
+
+        <!-- メニュー項目の編集 -->
+        <div class="bg-white rounded-3xl p-5 shadow-sm border">
+          <div class="flex justify-between items-center mb-4 flex-wrap gap-2">
+            <h3 class="font-bold text-gray-800 flex items-center gap-2">
+              <i class="fa-solid fa-list-check text-amber-600"></i> メニュー項目・価格・時間の追加・編集・削除
+            </h3>
+            <button type="button" onclick="restoreDefaultMenus()" class="px-3 py-1.5 bg-amber-500 hover:bg-amber-400 text-slate-900 font-bold rounded-xl text-xs border flex items-center gap-1 shadow cursor-pointer">
+              <i class="fa-solid fa-rotate-left"></i> 初期メニューに戻す
+            </button>
+          </div>
+          
+          <form onsubmit="saveAdminMenu(event)" class="space-y-3 text-xs border-b pb-4 mb-4">
+            <input type="hidden" id="edit-menu-id" value="">
+            <div class="grid grid-cols-2 gap-2">
+              <div>
+                <label class="block font-bold text-gray-600 mb-1">カテゴリ</label>
+                <select id="menu-form-cat" required="" class="w-full p-2.5 border rounded-xl bg-gray-50">
+                  <option value="カット">カット</option>
+                  <option value="カラー">カラー</option>
+                  <option value="パーマ">パーマ</option>
+                  <option value="縮毛矯正">縮毛矯正</option>
+                  <option value="トリートメント">トリートメント</option>
+                  <option value="スパ・その他">スパ・その他</option>
+                </select>
+              </div>
+              <div>
+                <label class="block font-bold text-gray-600 mb-1">メニュー名</label>
+                <input type="text" id="menu-form-name" required="" placeholder="例: 限定トリートメント" class="w-full p-2.5 border rounded-xl bg-gray-50">
+              </div>
+            </div>
+            <div class="grid grid-cols-2 gap-2">
+              <div>
+                <label class="block font-bold text-gray-600 mb-1">価格 (円)</label>
+                <input type="number" id="menu-form-price" required="" placeholder="5000" class="w-full p-2.5 border rounded-xl bg-gray-50">
+              </div>
+              <div>
+                <label class="block font-bold text-gray-600 mb-1">所要時間 (分)</label>
+                <input type="number" id="menu-form-time" required="" placeholder="60" class="w-full p-2.5 border rounded-xl bg-gray-50">
+              </div>
+            </div>
+            <div>
+              <label class="block font-bold text-gray-600 mb-1">説明文</label>
+              <input type="text" id="menu-form-desc" placeholder="メニューの説明を入力" class="w-full p-2.5 border rounded-xl bg-gray-50">
+            </div>
+            <div class="flex gap-2">
+              <button type="submit" id="menu-form-submit-btn" class="flex-1 py-3 bg-amber-500 hover:bg-amber-600 text-slate-900 font-bold rounded-xl shadow transition cursor-pointer">
+                ＋ メニューを追加する
+              </button>
+              <button type="button" id="menu-form-cancel-btn" onclick="resetMenuForm()" class="px-4 py-3 bg-gray-200 text-gray-700 font-bold rounded-xl hidden cursor-pointer">
+                キャンセル
+              </button>
+            </div>
+          </form>
+
+          <div class="overflow-x-auto">
+            <div id="admin-menu-list" class="space-y-2 max-h-80 overflow-y-auto pr-1">
+        <div class="p-3 border rounded-xl bg-gray-50 flex justify-between items-center gap-2 text-xs">
+          <div class="min-w-0 flex-1 break-words">
+            <span class="font-bold text-amber-600 font-mono">[カット]</span> 
+            <strong class="text-gray-800 ml-1">カット</strong> 
+            <span class="text-gray-500">(60分)</span>
+            <div class="text-emerald-700 font-bold mt-0.5">¥5,900</div>
+          </div>
+          <div class="flex gap-1 shrink-0">
+            <button type="button" onclick="editAdminMenu(1)" class="w-12 py-1.5 text-center whitespace-nowrap bg-amber-500 text-slate-900 font-bold rounded-lg cursor-pointer">編集</button>
+            <button type="button" onclick="deleteAdminMenu(1)" class="w-12 py-1.5 text-center whitespace-nowrap bg-red-500 text-white font-bold rounded-lg cursor-pointer">削除</button>
+          </div>
+        </div>
+      
+        <div class="p-3 border rounded-xl bg-gray-50 flex justify-between items-center gap-2 text-xs">
+          <div class="min-w-0 flex-1 break-words">
+            <span class="font-bold text-amber-600 font-mono">[カット]</span> 
+            <strong class="text-gray-800 ml-1">カット＋マイクロバブル＋炭酸スパ</strong> 
+            <span class="text-gray-500">(75分)</span>
+            <div class="text-emerald-700 font-bold mt-0.5">¥7,900</div>
+          </div>
+          <div class="flex gap-1 shrink-0">
+            <button type="button" onclick="editAdminMenu(2)" class="w-12 py-1.5 text-center whitespace-nowrap bg-amber-500 text-slate-900 font-bold rounded-lg cursor-pointer">編集</button>
+            <button type="button" onclick="deleteAdminMenu(2)" class="w-12 py-1.5 text-center whitespace-nowrap bg-red-500 text-white font-bold rounded-lg cursor-pointer">削除</button>
+          </div>
+        </div>
+      
+        <div class="p-3 border rounded-xl bg-gray-50 flex justify-between items-center gap-2 text-xs">
+          <div class="min-w-0 flex-1 break-words">
+            <span class="font-bold text-amber-600 font-mono">[カット]</span> 
+            <strong class="text-gray-800 ml-1">カット＋マイクロバブル＋リンケージトリートメント</strong> 
+            <span class="text-gray-500">(75分)</span>
+            <div class="text-emerald-700 font-bold mt-0.5">¥8,900</div>
+          </div>
+          <div class="flex gap-1 shrink-0">
+            <button type="button" onclick="editAdminMenu(3)" class="w-12 py-1.5 text-center whitespace-nowrap bg-amber-500 text-slate-900 font-bold rounded-lg cursor-pointer">編集</button>
+            <button type="button" onclick="deleteAdminMenu(3)" class="w-12 py-1.5 text-center whitespace-nowrap bg-red-500 text-white font-bold rounded-lg cursor-pointer">削除</button>
+          </div>
+        </div>
+      
+        <div class="p-3 border rounded-xl bg-gray-50 flex justify-between items-center gap-2 text-xs">
+          <div class="min-w-0 flex-1 break-words">
+            <span class="font-bold text-amber-600 font-mono">[カット]</span> 
+            <strong class="text-gray-800 ml-1">カット＋マイクロバブル＋リンケージトリートメント＋炭酸スパ</strong> 
+            <span class="text-gray-500">(90分)</span>
+            <div class="text-emerald-700 font-bold mt-0.5">¥10,400</div>
+          </div>
+          <div class="flex gap-1 shrink-0">
+            <button type="button" onclick="editAdminMenu(4)" class="w-12 py-1.5 text-center whitespace-nowrap bg-amber-500 text-slate-900 font-bold rounded-lg cursor-pointer">編集</button>
+            <button type="button" onclick="deleteAdminMenu(4)" class="w-12 py-1.5 text-center whitespace-nowrap bg-red-500 text-white font-bold rounded-lg cursor-pointer">削除</button>
+          </div>
+        </div>
+      
+        <div class="p-3 border rounded-xl bg-gray-50 flex justify-between items-center gap-2 text-xs">
+          <div class="min-w-0 flex-1 break-words">
+            <span class="font-bold text-amber-600 font-mono">[カット]</span> 
+            <strong class="text-gray-800 ml-1">カット＋頭皮ケアコース</strong> 
+            <span class="text-gray-500">(75分)</span>
+            <div class="text-emerald-700 font-bold mt-0.5">¥8,400</div>
+          </div>
+          <div class="flex gap-1 shrink-0">
+            <button type="button" onclick="editAdminMenu(5)" class="w-12 py-1.5 text-center whitespace-nowrap bg-amber-500 text-slate-900 font-bold rounded-lg cursor-pointer">編集</button>
+            <button type="button" onclick="deleteAdminMenu(5)" class="w-12 py-1.5 text-center whitespace-nowrap bg-red-500 text-white font-bold rounded-lg cursor-pointer">削除</button>
+          </div>
+        </div>
+      
+        <div class="p-3 border rounded-xl bg-gray-50 flex justify-between items-center gap-2 text-xs">
+          <div class="min-w-0 flex-1 break-words">
+            <span class="font-bold text-amber-600 font-mono">[カット]</span> 
+            <strong class="text-gray-800 ml-1">カット＋リラクゼーションコース</strong> 
+            <span class="text-gray-500">(90分)</span>
+            <div class="text-emerald-700 font-bold mt-0.5">¥9,900</div>
+          </div>
+          <div class="flex gap-1 shrink-0">
+            <button type="button" onclick="editAdminMenu(6)" class="w-12 py-1.5 text-center whitespace-nowrap bg-amber-500 text-slate-900 font-bold rounded-lg cursor-pointer">編集</button>
+            <button type="button" onclick="deleteAdminMenu(6)" class="w-12 py-1.5 text-center whitespace-nowrap bg-red-500 text-white font-bold rounded-lg cursor-pointer">削除</button>
+          </div>
+        </div>
+      
+        <div class="p-3 border rounded-xl bg-gray-50 flex justify-between items-center gap-2 text-xs">
+          <div class="min-w-0 flex-1 break-words">
+            <span class="font-bold text-amber-600 font-mono">[カット]</span> 
+            <strong class="text-gray-800 ml-1">前髪カット</strong> 
+            <span class="text-gray-500">(15分)</span>
+            <div class="text-emerald-700 font-bold mt-0.5">¥1,500</div>
+          </div>
+          <div class="flex gap-1 shrink-0">
+            <button type="button" onclick="editAdminMenu(7)" class="w-12 py-1.5 text-center whitespace-nowrap bg-amber-500 text-slate-900 font-bold rounded-lg cursor-pointer">編集</button>
+            <button type="button" onclick="deleteAdminMenu(7)" class="w-12 py-1.5 text-center whitespace-nowrap bg-red-500 text-white font-bold rounded-lg cursor-pointer">削除</button>
+          </div>
+        </div>
+      
+        <div class="p-3 border rounded-xl bg-gray-50 flex justify-between items-center gap-2 text-xs">
+          <div class="min-w-0 flex-1 break-words">
+            <span class="font-bold text-amber-600 font-mono">[カラー]</span> 
+            <strong class="text-gray-800 ml-1">カラー(SB、マイクロバブル込)</strong> 
+            <span class="text-gray-500">(90分)</span>
+            <div class="text-emerald-700 font-bold mt-0.5">¥9,400</div>
+          </div>
+          <div class="flex gap-1 shrink-0">
+            <button type="button" onclick="editAdminMenu(8)" class="w-12 py-1.5 text-center whitespace-nowrap bg-amber-500 text-slate-900 font-bold rounded-lg cursor-pointer">編集</button>
+            <button type="button" onclick="deleteAdminMenu(8)" class="w-12 py-1.5 text-center whitespace-nowrap bg-red-500 text-white font-bold rounded-lg cursor-pointer">削除</button>
+          </div>
+        </div>
+      
+        <div class="p-3 border rounded-xl bg-gray-50 flex justify-between items-center gap-2 text-xs">
+          <div class="min-w-0 flex-1 break-words">
+            <span class="font-bold text-amber-600 font-mono">[カラー]</span> 
+            <strong class="text-gray-800 ml-1">リタッチカラー(SB、マイクロバブル込み)</strong> 
+            <span class="text-gray-500">(75分)</span>
+            <div class="text-emerald-700 font-bold mt-0.5">¥8,900</div>
+          </div>
+          <div class="flex gap-1 shrink-0">
+            <button type="button" onclick="editAdminMenu(9)" class="w-12 py-1.5 text-center whitespace-nowrap bg-amber-500 text-slate-900 font-bold rounded-lg cursor-pointer">編集</button>
+            <button type="button" onclick="deleteAdminMenu(9)" class="w-12 py-1.5 text-center whitespace-nowrap bg-red-500 text-white font-bold rounded-lg cursor-pointer">削除</button>
+          </div>
+        </div>
+      
+        <div class="p-3 border rounded-xl bg-gray-50 flex justify-between items-center gap-2 text-xs">
+          <div class="min-w-0 flex-1 break-words">
+            <span class="font-bold text-amber-600 font-mono">[カラー]</span> 
+            <strong class="text-gray-800 ml-1">カラー＋炭酸ヘッドスパ＋マイクロバブル</strong> 
+            <span class="text-gray-500">(90分)</span>
+            <div class="text-emerald-700 font-bold mt-0.5">¥10,900</div>
+          </div>
+          <div class="flex gap-1 shrink-0">
+            <button type="button" onclick="editAdminMenu(10)" class="w-12 py-1.5 text-center whitespace-nowrap bg-amber-500 text-slate-900 font-bold rounded-lg cursor-pointer">編集</button>
+            <button type="button" onclick="deleteAdminMenu(10)" class="w-12 py-1.5 text-center whitespace-nowrap bg-red-500 text-white font-bold rounded-lg cursor-pointer">削除</button>
+          </div>
+        </div>
+      
+        <div class="p-3 border rounded-xl bg-gray-50 flex justify-between items-center gap-2 text-xs">
+          <div class="min-w-0 flex-1 break-words">
+            <span class="font-bold text-amber-600 font-mono">[カラー]</span> 
+            <strong class="text-gray-800 ml-1">カラー＋マイクロバブル＋リンケージトリートメント</strong> 
+            <span class="text-gray-500">(90分)</span>
+            <div class="text-emerald-700 font-bold mt-0.5">¥12,400</div>
+          </div>
+          <div class="flex gap-1 shrink-0">
+            <button type="button" onclick="editAdminMenu(11)" class="w-12 py-1.5 text-center whitespace-nowrap bg-amber-500 text-slate-900 font-bold rounded-lg cursor-pointer">編集</button>
+            <button type="button" onclick="deleteAdminMenu(11)" class="w-12 py-1.5 text-center whitespace-nowrap bg-red-500 text-white font-bold rounded-lg cursor-pointer">削除</button>
+          </div>
+        </div>
+      
+        <div class="p-3 border rounded-xl bg-gray-50 flex justify-between items-center gap-2 text-xs">
+          <div class="min-w-0 flex-1 break-words">
+            <span class="font-bold text-amber-600 font-mono">[カラー]</span> 
+            <strong class="text-gray-800 ml-1">カラー＋炭酸ヘッドスパ＋リンケージバブルトリートメント＋マイクロバブル</strong> 
+            <span class="text-gray-500">(105分)</span>
+            <div class="text-emerald-700 font-bold mt-0.5">¥13,900</div>
+          </div>
+          <div class="flex gap-1 shrink-0">
+            <button type="button" onclick="editAdminMenu(12)" class="w-12 py-1.5 text-center whitespace-nowrap bg-amber-500 text-slate-900 font-bold rounded-lg cursor-pointer">編集</button>
+            <button type="button" onclick="deleteAdminMenu(12)" class="w-12 py-1.5 text-center whitespace-nowrap bg-red-500 text-white font-bold rounded-lg cursor-pointer">削除</button>
+          </div>
+        </div>
+      
+        <div class="p-3 border rounded-xl bg-gray-50 flex justify-between items-center gap-2 text-xs">
+          <div class="min-w-0 flex-1 break-words">
+            <span class="font-bold text-amber-600 font-mono">[カラー]</span> 
+            <strong class="text-gray-800 ml-1">リタッチカラー(SB込み) ＋炭酸スパ＋マイクロバブル</strong> 
+            <span class="text-gray-500">(75分)</span>
+            <div class="text-emerald-700 font-bold mt-0.5">¥9,900</div>
+          </div>
+          <div class="flex gap-1 shrink-0">
+            <button type="button" onclick="editAdminMenu(13)" class="w-12 py-1.5 text-center whitespace-nowrap bg-amber-500 text-slate-900 font-bold rounded-lg cursor-pointer">編集</button>
+            <button type="button" onclick="deleteAdminMenu(13)" class="w-12 py-1.5 text-center whitespace-nowrap bg-red-500 text-white font-bold rounded-lg cursor-pointer">削除</button>
+          </div>
+        </div>
+      
+        <div class="p-3 border rounded-xl bg-gray-50 flex justify-between items-center gap-2 text-xs">
+          <div class="min-w-0 flex-1 break-words">
+            <span class="font-bold text-amber-600 font-mono">[カラー]</span> 
+            <strong class="text-gray-800 ml-1">リタッチカラー ＋リンケージトリートメント ＋マイクロバブル</strong> 
+            <span class="text-gray-500">(75分)</span>
+            <div class="text-emerald-700 font-bold mt-0.5">¥11,400</div>
+          </div>
+          <div class="flex gap-1 shrink-0">
+            <button type="button" onclick="editAdminMenu(14)" class="w-12 py-1.5 text-center whitespace-nowrap bg-amber-500 text-slate-900 font-bold rounded-lg cursor-pointer">編集</button>
+            <button type="button" onclick="deleteAdminMenu(14)" class="w-12 py-1.5 text-center whitespace-nowrap bg-red-500 text-white font-bold rounded-lg cursor-pointer">削除</button>
+          </div>
+        </div>
+      
+        <div class="p-3 border rounded-xl bg-gray-50 flex justify-between items-center gap-2 text-xs">
+          <div class="min-w-0 flex-1 break-words">
+            <span class="font-bold text-amber-600 font-mono">[カラー]</span> 
+            <strong class="text-gray-800 ml-1">カット＋カラー＋炭酸ヘッドスパ＋マイクロバブル</strong> 
+            <span class="text-gray-500">(120分)</span>
+            <div class="text-emerald-700 font-bold mt-0.5">¥13,900</div>
+          </div>
+          <div class="flex gap-1 shrink-0">
+            <button type="button" onclick="editAdminMenu(15)" class="w-12 py-1.5 text-center whitespace-nowrap bg-amber-500 text-slate-900 font-bold rounded-lg cursor-pointer">編集</button>
+            <button type="button" onclick="deleteAdminMenu(15)" class="w-12 py-1.5 text-center whitespace-nowrap bg-red-500 text-white font-bold rounded-lg cursor-pointer">削除</button>
+          </div>
+        </div>
+      
+        <div class="p-3 border rounded-xl bg-gray-50 flex justify-between items-center gap-2 text-xs">
+          <div class="min-w-0 flex-1 break-words">
+            <span class="font-bold text-amber-600 font-mono">[カラー]</span> 
+            <strong class="text-gray-800 ml-1">カット＋カラー＋リンケージトリートメント＋マイクロバブル</strong> 
+            <span class="text-gray-500">(135分)</span>
+            <div class="text-emerald-700 font-bold mt-0.5">¥15,400</div>
+          </div>
+          <div class="flex gap-1 shrink-0">
+            <button type="button" onclick="editAdminMenu(16)" class="w-12 py-1.5 text-center whitespace-nowrap bg-amber-500 text-slate-900 font-bold rounded-lg cursor-pointer">編集</button>
+            <button type="button" onclick="deleteAdminMenu(16)" class="w-12 py-1.5 text-center whitespace-nowrap bg-red-500 text-white font-bold rounded-lg cursor-pointer">削除</button>
+          </div>
+        </div>
+      
+        <div class="p-3 border rounded-xl bg-gray-50 flex justify-between items-center gap-2 text-xs">
+          <div class="min-w-0 flex-1 break-words">
+            <span class="font-bold text-amber-600 font-mono">[カラー]</span> 
+            <strong class="text-gray-800 ml-1">カット＋カラー＋炭酸ヘッドスパ＋リンケージトリートメント＋マイクロバブル</strong> 
+            <span class="text-gray-500">(150分)</span>
+            <div class="text-emerald-700 font-bold mt-0.5">¥16,900</div>
+          </div>
+          <div class="flex gap-1 shrink-0">
+            <button type="button" onclick="editAdminMenu(17)" class="w-12 py-1.5 text-center whitespace-nowrap bg-amber-500 text-slate-900 font-bold rounded-lg cursor-pointer">編集</button>
+            <button type="button" onclick="deleteAdminMenu(17)" class="w-12 py-1.5 text-center whitespace-nowrap bg-red-500 text-white font-bold rounded-lg cursor-pointer">削除</button>
+          </div>
+        </div>
+      
+        <div class="p-3 border rounded-xl bg-gray-50 flex justify-between items-center gap-2 text-xs">
+          <div class="min-w-0 flex-1 break-words">
+            <span class="font-bold text-amber-600 font-mono">[パーマ]</span> 
+            <strong class="text-gray-800 ml-1">パーマ(SB込)</strong> 
+            <span class="text-gray-500">(90分)</span>
+            <div class="text-emerald-700 font-bold mt-0.5">¥8,900</div>
+          </div>
+          <div class="flex gap-1 shrink-0">
+            <button type="button" onclick="editAdminMenu(18)" class="w-12 py-1.5 text-center whitespace-nowrap bg-amber-500 text-slate-900 font-bold rounded-lg cursor-pointer">編集</button>
+            <button type="button" onclick="deleteAdminMenu(18)" class="w-12 py-1.5 text-center whitespace-nowrap bg-red-500 text-white font-bold rounded-lg cursor-pointer">削除</button>
+          </div>
+        </div>
+      
+        <div class="p-3 border rounded-xl bg-gray-50 flex justify-between items-center gap-2 text-xs">
+          <div class="min-w-0 flex-1 break-words">
+            <span class="font-bold text-amber-600 font-mono">[パーマ]</span> 
+            <strong class="text-gray-800 ml-1">カット＋パーマ＋炭酸ヘッドスパ＋マイクロバブル</strong> 
+            <span class="text-gray-500">(120分)</span>
+            <div class="text-emerald-700 font-bold mt-0.5">¥13,900</div>
+          </div>
+          <div class="flex gap-1 shrink-0">
+            <button type="button" onclick="editAdminMenu(19)" class="w-12 py-1.5 text-center whitespace-nowrap bg-amber-500 text-slate-900 font-bold rounded-lg cursor-pointer">編集</button>
+            <button type="button" onclick="deleteAdminMenu(19)" class="w-12 py-1.5 text-center whitespace-nowrap bg-red-500 text-white font-bold rounded-lg cursor-pointer">削除</button>
+          </div>
+        </div>
+      
+        <div class="p-3 border rounded-xl bg-gray-50 flex justify-between items-center gap-2 text-xs">
+          <div class="min-w-0 flex-1 break-words">
+            <span class="font-bold text-amber-600 font-mono">[パーマ]</span> 
+            <strong class="text-gray-800 ml-1">カット＋パーマ＋リンケージトリートメント＋マイクロバブル</strong> 
+            <span class="text-gray-500">(135分)</span>
+            <div class="text-emerald-700 font-bold mt-0.5">¥15,400</div>
+          </div>
+          <div class="flex gap-1 shrink-0">
+            <button type="button" onclick="editAdminMenu(20)" class="w-12 py-1.5 text-center whitespace-nowrap bg-amber-500 text-slate-900 font-bold rounded-lg cursor-pointer">編集</button>
+            <button type="button" onclick="deleteAdminMenu(20)" class="w-12 py-1.5 text-center whitespace-nowrap bg-red-500 text-white font-bold rounded-lg cursor-pointer">削除</button>
+          </div>
+        </div>
+      
+        <div class="p-3 border rounded-xl bg-gray-50 flex justify-between items-center gap-2 text-xs">
+          <div class="min-w-0 flex-1 break-words">
+            <span class="font-bold text-amber-600 font-mono">[縮毛矯正]</span> 
+            <strong class="text-gray-800 ml-1">前髪縮毛矯正</strong> 
+            <span class="text-gray-500">(90分)</span>
+            <div class="text-emerald-700 font-bold mt-0.5">¥9,900</div>
+          </div>
+          <div class="flex gap-1 shrink-0">
+            <button type="button" onclick="editAdminMenu(21)" class="w-12 py-1.5 text-center whitespace-nowrap bg-amber-500 text-slate-900 font-bold rounded-lg cursor-pointer">編集</button>
+            <button type="button" onclick="deleteAdminMenu(21)" class="w-12 py-1.5 text-center whitespace-nowrap bg-red-500 text-white font-bold rounded-lg cursor-pointer">削除</button>
+          </div>
+        </div>
+      
+        <div class="p-3 border rounded-xl bg-gray-50 flex justify-between items-center gap-2 text-xs">
+          <div class="min-w-0 flex-1 break-words">
+            <span class="font-bold text-amber-600 font-mono">[縮毛矯正]</span> 
+            <strong class="text-gray-800 ml-1">顔周り縮毛矯正</strong> 
+            <span class="text-gray-500">(105分)</span>
+            <div class="text-emerald-700 font-bold mt-0.5">¥12,900</div>
+          </div>
+          <div class="flex gap-1 shrink-0">
+            <button type="button" onclick="editAdminMenu(22)" class="w-12 py-1.5 text-center whitespace-nowrap bg-amber-500 text-slate-900 font-bold rounded-lg cursor-pointer">編集</button>
+            <button type="button" onclick="deleteAdminMenu(22)" class="w-12 py-1.5 text-center whitespace-nowrap bg-red-500 text-white font-bold rounded-lg cursor-pointer">削除</button>
+          </div>
+        </div>
+      
+        <div class="p-3 border rounded-xl bg-gray-50 flex justify-between items-center gap-2 text-xs">
+          <div class="min-w-0 flex-1 break-words">
+            <span class="font-bold text-amber-600 font-mono">[縮毛矯正]</span> 
+            <strong class="text-gray-800 ml-1">ハーフ縮毛矯正</strong> 
+            <span class="text-gray-500">(120分)</span>
+            <div class="text-emerald-700 font-bold mt-0.5">¥14,900</div>
+          </div>
+          <div class="flex gap-1 shrink-0">
+            <button type="button" onclick="editAdminMenu(23)" class="w-12 py-1.5 text-center whitespace-nowrap bg-amber-500 text-slate-900 font-bold rounded-lg cursor-pointer">編集</button>
+            <button type="button" onclick="deleteAdminMenu(23)" class="w-12 py-1.5 text-center whitespace-nowrap bg-red-500 text-white font-bold rounded-lg cursor-pointer">削除</button>
+          </div>
+        </div>
+      
+        <div class="p-3 border rounded-xl bg-gray-50 flex justify-between items-center gap-2 text-xs">
+          <div class="min-w-0 flex-1 break-words">
+            <span class="font-bold text-amber-600 font-mono">[縮毛矯正]</span> 
+            <strong class="text-gray-800 ml-1">縮毛矯正(SB込)</strong> 
+            <span class="text-gray-500">(150分)</span>
+            <div class="text-emerald-700 font-bold mt-0.5">¥17,900</div>
+          </div>
+          <div class="flex gap-1 shrink-0">
+            <button type="button" onclick="editAdminMenu(24)" class="w-12 py-1.5 text-center whitespace-nowrap bg-amber-500 text-slate-900 font-bold rounded-lg cursor-pointer">編集</button>
+            <button type="button" onclick="deleteAdminMenu(24)" class="w-12 py-1.5 text-center whitespace-nowrap bg-red-500 text-white font-bold rounded-lg cursor-pointer">削除</button>
+          </div>
+        </div>
+      
+        <div class="p-3 border rounded-xl bg-gray-50 flex justify-between items-center gap-2 text-xs">
+          <div class="min-w-0 flex-1 break-words">
+            <span class="font-bold text-amber-600 font-mono">[縮毛矯正]</span> 
+            <strong class="text-gray-800 ml-1">カット＋縮毛矯正＋ヘッドスパ＋マイクロバブル</strong> 
+            <span class="text-gray-500">(180分)</span>
+            <div class="text-emerald-700 font-bold mt-0.5">¥23,900</div>
+          </div>
+          <div class="flex gap-1 shrink-0">
+            <button type="button" onclick="editAdminMenu(25)" class="w-12 py-1.5 text-center whitespace-nowrap bg-amber-500 text-slate-900 font-bold rounded-lg cursor-pointer">編集</button>
+            <button type="button" onclick="deleteAdminMenu(25)" class="w-12 py-1.5 text-center whitespace-nowrap bg-red-500 text-white font-bold rounded-lg cursor-pointer">削除</button>
+          </div>
+        </div>
+      
+        <div class="p-3 border rounded-xl bg-gray-50 flex justify-between items-center gap-2 text-xs">
+          <div class="min-w-0 flex-1 break-words">
+            <span class="font-bold text-amber-600 font-mono">[縮毛矯正]</span> 
+            <strong class="text-gray-800 ml-1">カット＋縮毛矯正＋リンケージトリートメント＋マイクロバブル</strong> 
+            <span class="text-gray-500">(195分)</span>
+            <div class="text-emerald-700 font-bold mt-0.5">¥25,400</div>
+          </div>
+          <div class="flex gap-1 shrink-0">
+            <button type="button" onclick="editAdminMenu(26)" class="w-12 py-1.5 text-center whitespace-nowrap bg-amber-500 text-slate-900 font-bold rounded-lg cursor-pointer">編集</button>
+            <button type="button" onclick="deleteAdminMenu(26)" class="w-12 py-1.5 text-center whitespace-nowrap bg-red-500 text-white font-bold rounded-lg cursor-pointer">削除</button>
+          </div>
+        </div>
+      
+        <div class="p-3 border rounded-xl bg-gray-50 flex justify-between items-center gap-2 text-xs">
+          <div class="min-w-0 flex-1 break-words">
+            <span class="font-bold text-amber-600 font-mono">[縮毛矯正]</span> 
+            <strong class="text-gray-800 ml-1">カット＋縮毛矯正＋炭酸ヘッドスパ＋トリートメント＋マイクロバブル</strong> 
+            <span class="text-gray-500">(210分)</span>
+            <div class="text-emerald-700 font-bold mt-0.5">¥26,900</div>
+          </div>
+          <div class="flex gap-1 shrink-0">
+            <button type="button" onclick="editAdminMenu(27)" class="w-12 py-1.5 text-center whitespace-nowrap bg-amber-500 text-slate-900 font-bold rounded-lg cursor-pointer">編集</button>
+            <button type="button" onclick="deleteAdminMenu(27)" class="w-12 py-1.5 text-center whitespace-nowrap bg-red-500 text-white font-bold rounded-lg cursor-pointer">削除</button>
+          </div>
+        </div>
+      
+        <div class="p-3 border rounded-xl bg-gray-50 flex justify-between items-center gap-2 text-xs">
+          <div class="min-w-0 flex-1 break-words">
+            <span class="font-bold text-amber-600 font-mono">[トリートメント]</span> 
+            <strong class="text-gray-800 ml-1">リンケージ トリートメント ※SB別になります</strong> 
+            <span class="text-gray-500">(30分)</span>
+            <div class="text-emerald-700 font-bold mt-0.5">¥4,400</div>
+          </div>
+          <div class="flex gap-1 shrink-0">
+            <button type="button" onclick="editAdminMenu(28)" class="w-12 py-1.5 text-center whitespace-nowrap bg-amber-500 text-slate-900 font-bold rounded-lg cursor-pointer">編集</button>
+            <button type="button" onclick="deleteAdminMenu(28)" class="w-12 py-1.5 text-center whitespace-nowrap bg-red-500 text-white font-bold rounded-lg cursor-pointer">削除</button>
+          </div>
+        </div>
+      
+        <div class="p-3 border rounded-xl bg-gray-50 flex justify-between items-center gap-2 text-xs">
+          <div class="min-w-0 flex-1 break-words">
+            <span class="font-bold text-amber-600 font-mono">[スパ・その他]</span> 
+            <strong class="text-gray-800 ml-1">ヘッドスパ(ツボ押しタイプ)SB込み</strong> 
+            <span class="text-gray-500">(45分)</span>
+            <div class="text-emerald-700 font-bold mt-0.5">¥6,200</div>
+          </div>
+          <div class="flex gap-1 shrink-0">
+            <button type="button" onclick="editAdminMenu(29)" class="w-12 py-1.5 text-center whitespace-nowrap bg-amber-500 text-slate-900 font-bold rounded-lg cursor-pointer">編集</button>
+            <button type="button" onclick="deleteAdminMenu(29)" class="w-12 py-1.5 text-center whitespace-nowrap bg-red-500 text-white font-bold rounded-lg cursor-pointer">削除</button>
+          </div>
+        </div>
+      
+        <div class="p-3 border rounded-xl bg-gray-50 flex justify-between items-center gap-2 text-xs">
+          <div class="min-w-0 flex-1 break-words">
+            <span class="font-bold text-amber-600 font-mono">[スパ・その他]</span> 
+            <strong class="text-gray-800 ml-1">シャンプーブロー</strong> 
+            <span class="text-gray-500">(30分)</span>
+            <div class="text-emerald-700 font-bold mt-0.5">¥3,900</div>
+          </div>
+          <div class="flex gap-1 shrink-0">
+            <button type="button" onclick="editAdminMenu(30)" class="w-12 py-1.5 text-center whitespace-nowrap bg-amber-500 text-slate-900 font-bold rounded-lg cursor-pointer">編集</button>
+            <button type="button" onclick="deleteAdminMenu(30)" class="w-12 py-1.5 text-center whitespace-nowrap bg-red-500 text-white font-bold rounded-lg cursor-pointer">削除</button>
+          </div>
+        </div>
+      </div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+
+  </main>
+
+  <!-- モーダル: カレンダー -->
+  <div id="calendar-modal" class="fixed inset-0 modal-bg flex items-center justify-center p-4 z-50 hidden">
+    <div class="bg-white rounded-3xl p-6 w-full max-w-lg shadow-2xl max-h-[90vh] overflow-y-auto">
+      <div class="flex justify-between items-center mb-4 pb-2 border-b">
+        <h3 class="font-bold text-gray-800 text-sm flex items-center gap-2">
+          <i class="fa-solid fa-calendar-days text-amber-500"></i> 日付を選んでください
+        </h3>
+        <button type="button" onclick="closeCalendarModal()" class="text-gray-400 hover:text-gray-600 text-sm font-bold px-2 py-1 cursor-pointer">✕ 閉じる</button>
+      </div>
+      <div id="calendar-grid-container" class="mb-2"></div>
+    </div>
+  </div>
+
+  <!-- モーダル: 時間選択 -->
+  <div id="time-modal" class="fixed inset-0 modal-bg flex items-center justify-center p-4 z-50 hidden">
+    <div class="bg-white rounded-3xl p-6 w-full max-w-md shadow-2xl">
+      <div class="flex justify-between items-center mb-4 pb-2 border-b">
+        <h3 class="font-bold text-gray-800 text-sm flex items-center gap-2">
+          <i class="fa-solid fa-clock text-amber-500"></i> <span id="modal-selected-date-display" class="text-amber-600"></span> の時間を選択
+        </h3>
+        <button type="button" onclick="closeTimeModal()" class="text-gray-400 hover:text-gray-600 text-sm font-bold px-2 py-1 cursor-pointer">✕ 戻る</button>
+      </div>
+      <div id="time-slots-list" class="grid grid-cols-3 gap-2 mb-4"></div>
+    </div>
+  </div>
+
+  <!-- モーダル: 店舗管理ログイン -->
+  <div id="auth-modal" class="fixed inset-0 modal-bg flex items-center justify-center p-4 z-50 hidden">
+    <div class="bg-white rounded-3xl p-6 w-full max-w-sm shadow-2xl">
+      <div class="text-center mb-4">
+        <h3 class="font-bold text-gray-800">店舗管理ログイン</h3>
+        <p class="text-xs text-gray-500 mt-1">管理画面へのアクセス</p>
+      </div>
+      <input type="password" id="admin-pin" placeholder="暗証番号を入力" class="w-full text-center text-xl tracking-widest p-3 border-2 border-amber-400 rounded-2xl mb-4 font-mono" onkeypress="if(event.key==='Enter') verifyAdminPin()">
+      <div class="flex gap-2">
+        <button type="button" onclick="closeAdminAuth()" class="flex-1 py-3 bg-gray-200 text-gray-700 rounded-2xl text-xs font-bold cursor-pointer">キャンセル</button>
+        <button type="button" onclick="verifyAdminPin()" class="flex-1 py-3 bg-amber-500 text-slate-900 rounded-2xl text-xs font-bold shadow cursor-pointer">認証</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- カスタム通知ダイアログ -->
+  <div id="toast-modal" class="fixed inset-0 modal-bg flex items-center justify-center p-4 z-50 hidden">
+    <div class="bg-white rounded-3xl p-6 w-full max-w-sm shadow-2xl text-center">
+      <div class="w-12 h-12 bg-emerald-100 text-emerald-500 rounded-full flex items-center justify-center mx-auto mb-3 text-2xl">
+        <i class="fa-solid fa-circle-check"></i>
+      </div>
+      <h3 class="font-bold text-gray-800 text-base mb-1" id="toast-title">通知</h3>
+      <p class="text-xs text-gray-600 mb-5 leading-relaxed" id="toast-msg"></p>
+      <button type="button" onclick="closeToast()" class="w-full py-3 bg-slate-900 hover:bg-slate-800 text-white rounded-2xl text-xs font-bold shadow cursor-pointer">
+        OK（閉じる）
+      </button>
+    </div>
+  </div>
+
+  <script>
+    const cloud = window.cloud = {
+      cache: {}, save: null,
+      setSlots(m, b) { state.slots = m; state.blocks = b || {}; renderAdminCalendar(); },
+      setReservations(a) { state.reservations = a; renderReservations(); updateDashboard(); },
+      get(key) { return key in this.cache ? this.cache[key] : null; },
+      set(key, val) {
+        this.cache[key] = val;
+        if (this.save) this.save(key, val).catch(err => { console.error(err); notify('保存に失敗しました。通信状況を確認してください。\n（' + errText(err) + '）'); });
+      }
+    };
+    const initialMenus = [
+      { id: 1, category: "カット", name: "カット", price: 5900, time: 60, desc: "カット単品メニュー" },
+      { id: 2, category: "カット", name: "カット＋マイクロバブル＋炭酸スパ", price: 7900, time: 75, desc: "カット＋マイクロバブル＋スパ" },
+      { id: 3, category: "カット", name: "カット＋マイクロバブル＋リンケージトリートメント", price: 8900, time: 75, desc: "カット＋クレンジング＋トリートメントになります" },
+      { id: 4, category: "カット", name: "カット＋マイクロバブル＋リンケージトリートメント＋炭酸スパ", price: 10400, time: 90, desc: "カット＋クレンジング＋炭酸スパ＋トリートメントになります" },
+      { id: 5, category: "カット", name: "カット＋頭皮ケアコース", price: 8400, time: 75, desc: "カット＋マイクロバブル＋炭酸スパ＋頭皮用トリートメント＆シャンプー" },
+      { id: 6, category: "カット", name: "カット＋リラクゼーションコース", price: 9900, time: 90, desc: "カット＋炭酸スパ＋ツボ押しスパ（クイック）＋マイクロバブル" },
+      { id: 7, category: "カット", name: "前髪カット", price: 1500, time: 15, desc: "前髪のみのポイントカット" },
+      { id: 8, category: "カラー", name: "カラー(SB、マイクロバブル込)", price: 9400, time: 90, desc: "ブリーチ+2000円" },
+      { id: 9, category: "カラー", name: "リタッチカラー(SB、マイクロバブル込み)", price: 8900, time: 75, desc: "根元3cm前後" },
+      { id: 10, category: "カラー", name: "カラー＋炭酸ヘッドスパ＋マイクロバブル", price: 10900, time: 90, desc: "ブリーチを使う場合は+1100円から2200円" },
+      { id: 11, category: "カラー", name: "カラー＋マイクロバブル＋リンケージトリートメント", price: 12400, time: 90, desc: "ブリーチを使う場合は+1100円から2200円" },
+      { id: 12, category: "カラー", name: "カラー＋炭酸ヘッドスパ＋リンケージバブルトリートメント＋マイクロバブル", price: 13900, time: 105, desc: "ブリーチを使う場合は+1100円から2200円" },
+      { id: 13, category: "カラー", name: "リタッチカラー(SB込み) ＋炭酸スパ＋マイクロバブル", price: 9900, time: 75, desc: "リタッチカラー マイクロバブル 炭酸スパになります！およそ3cm目安とさせていただきます！" },
+      { id: 14, category: "カラー", name: "リタッチカラー ＋リンケージトリートメント ＋マイクロバブル", price: 11400, time: 75, desc: "リタッチカラー リンケージトリートメント マイクロバブル 炭酸スパ +660でホームケア" },
+      { id: 15, category: "カラー", name: "カット＋カラー＋炭酸ヘッドスパ＋マイクロバブル", price: 13900, time: 120, desc: "ダブルカラー特殊カラーは除きます +2000円でリンケージ +660円ホームケア" },
+      { id: 16, category: "カラー", name: "カット＋カラー＋リンケージトリートメント＋マイクロバブル", price: 15400, time: 135, desc: "ダブルカラー等は除きます ＋1500円で炭酸ヘッドスパ" },
+      { id: 17, category: "カラー", name: "カット＋カラー＋炭酸ヘッドスパ＋リンケージトリートメント＋マイクロバブル", price: 16900, time: 150, desc: "フルフルコースメニュー" },
+      { id: 18, category: "パーマ", name: "パーマ(SB込)", price: 8900, time: 90, desc: "パーマ単品メニュー" },
+      { id: 19, category: "パーマ", name: "カット＋パーマ＋炭酸ヘッドスパ＋マイクロバブル", price: 13900, time: 120, desc: "特殊パーマは除きます" },
+      { id: 20, category: "パーマ", name: "カット＋パーマ＋リンケージトリートメント＋マイクロバブル", price: 15400, time: 135, desc: "特殊パーマは除きます" },
+      { id: 21, category: "縮毛矯正", name: "前髪縮毛矯正", price: 9900, time: 90, desc: "前髪のみの縮毛矯正" },
+      { id: 22, category: "縮毛矯正", name: "顔周り縮毛矯正", price: 12900, time: 105, desc: "顔周りの縮毛矯正" },
+      { id: 23, category: "縮毛矯正", name: "ハーフ縮毛矯正", price: 14900, time: 120, desc: "範囲が全体の半分くらいの縮毛です" },
+      { id: 24, category: "縮毛矯正", name: "縮毛矯正(SB込)", price: 17900, time: 150, desc: "全頭縮毛矯正" },
+      { id: 25, category: "縮毛矯正", name: "カット＋縮毛矯正＋ヘッドスパ＋マイクロバブル", price: 23900, time: 180, desc: "フルコース縮毛矯正" },
+      { id: 26, category: "縮毛矯正", name: "カット＋縮毛矯正＋リンケージトリートメント＋マイクロバブル", price: 25400, time: 195, desc: "トリートメント付縮毛矯正" },
+      { id: 27, category: "縮毛矯正", name: "カット＋縮毛矯正＋炭酸ヘッドスパ＋トリートメント＋マイクロバブル", price: 26900, time: 210, desc: "プレミアム縮毛矯正コース" },
+      { id: 28, category: "トリートメント", name: "リンケージ トリートメント ※SB別になります", price: 4400, time: 30, desc: "ホームケア付き" },
+      { id: 29, category: "スパ・その他", name: "ヘッドスパ(ツボ押しタイプ)SB込み", price: 6200, time: 45, desc: "ツボ押しスパ" },
+      { id: 30, category: "スパ・その他", name: "シャンプーブロー", price: 3900, time: 30, desc: "シャンプー＆ブロー" }
+    ];
+
+    const categories = ["すべて", "カット", "カラー", "パーマ", "縮毛矯正", "トリートメント", "スパ・その他"];
+    const DEFAULT_BOOKING = { timeSlots: Array.from({ length: 20 }, (_, i) => { const m = 570 + i * 30; return String(Math.floor(m / 60)).padStart(2, '0') + ':' + String(m % 60).padStart(2, '0'); }), minDays: 1, maxDays: 120, cancelDays: 1 };
+    let timeSlots = [...DEFAULT_BOOKING.timeSlots];
+
+    let allMenus = [];
+    let currentFilterPeriod = 'all';
+    const state = {
+      pin: "tina0422",
+      slots: {},
+      dayHours: {},
+      blocks: {},
+      booking: { ...DEFAULT_BOOKING },
+      activeCategory: "すべて",
+      selectedMenuIds: [],
+      selectedDate: null,
+      selectedTime: null,
+      customHolidays: JSON.parse(cloud.get('rhp_custom_holidays_nocoup')) || [],
+      reservations: JSON.parse(cloud.get('rhp_reservations_nocoup')) || [],
+      kartes: JSON.parse(cloud.get('rhp_kartes_nocoup')) || [],
+      newsSettings: JSON.parse(cloud.get('rhp_news_settings_nocoup')) || { active: false, date: '', title: '', content: '' },
+      heroSettings: JSON.parse(cloud.get('rhp_hero_settings_nocoup')) || {
+        tag: "完全マンツーマン施術",
+        title: "大人の髪悩みに寄り添うプライベートサロン",
+        desc: "名古屋市南区元鳴尾町の隠れ家サロン。COTA・リケラ・ReFa取扱店。あなたの魅力を最大限に引き出すヘアスタイルと髪質改善をご提案します。"
+      }
+    };
+
+    function showToast(title, msg) {
+      document.getElementById('toast-title').innerText = title;
+      document.getElementById('toast-msg').innerText = msg;
+      document.getElementById('toast-modal').classList.remove('hidden');
+    }
+
+    function closeToast() {
+      document.getElementById('toast-modal').classList.add('hidden');
+    }
+
+    function showTab(tabName) {
+  document.querySelectorAll('.tab-content').forEach(el => {
+    const isTarget = el.id === `tab-${tabName}`;
+    el.classList.toggle('hidden', !isTarget);
+    el.style.display = isTarget ? 'block' : 'none';
+  });
+}
+
+    function openAdminAuth() {
+      document.getElementById('auth-modal').classList.remove('hidden');
+    }
+
+    function closeAdminAuth() {
+      document.getElementById('auth-modal').classList.add('hidden');
+    }
+
+    function verifyAdminPin() {
+      const input = document.getElementById('admin-pin').value;
+      if (input === state.pin) {
+        closeAdminAuth();
+        showTab('admin');
+        if (window.subscribeAdmin) window.subscribeAdmin();
+        document.getElementById('admin-pin').value = '';
+      } else {
+        notify('暗証番号が正しくありません。');
+      }
+    }
+
+    function logoutAdmin() {
+      showTab('booking');
+    }
+
+    function restoreDefaultMenus() {
+      allMenus = [...initialMenus];
+      cloud.set('rhp_custom_menus_nocoup', JSON.stringify(allMenus));
+      renderMenuCategories();
+      renderMenuList();
+      renderAdminMenuList();
+      showToast('✅ 復元完了', '初期メニューに全件復元しました！');
+    }
+
+    function initSystem() {
+      const saved = cloud.get('rhp_custom_menus_nocoup');
+      if (saved) {
+        try { allMenus = JSON.parse(saved); } catch(e) { allMenus = [...initialMenus]; }
+      } else {
+        allMenus = [...initialMenus];
+      }
+
+      applyHeroSettings();
+      applyBookingSettings();
+      renderNewsBanner();
+      renderNewsSettings();
+      renderMenuCategories();
+      renderMenuList();
+      renderAdminMenuList();
+      renderReservations();
+      renderKartes();
+      renderCustomHolidays();
+      updateDashboard();
+      if (!window.__started) showTab('booking');
+    }
+
+    function applyHeroSettings() {
+      document.getElementById('hero-tag').innerText = state.heroSettings.tag;
+      document.getElementById('hero-title').innerText = state.heroSettings.title;
+      document.getElementById('hero-desc').innerText = state.heroSettings.desc;
+      document.getElementById('hero-edit-tag').value = state.heroSettings.tag;
+      document.getElementById('hero-edit-title').value = state.heroSettings.title;
+      document.getElementById('hero-edit-desc').value = state.heroSettings.desc;
+    }
+
+    function saveHeroSettings(e) {
+      e.preventDefault();
+      state.heroSettings = {
+        tag: document.getElementById('hero-edit-tag').value,
+        title: document.getElementById('hero-edit-title').value,
+        desc: document.getElementById('hero-edit-desc').value
+      };
+      cloud.set('rhp_hero_settings_nocoup', JSON.stringify(state.heroSettings));
+      applyHeroSettings();
+      showToast('✅ 更新完了', 'トップ画面の文章を保存しました！');
+    }
+
+    function renderMenuCategories() {
+      const container = document.getElementById('menu-category-tabs');
+      if (!container) return;
+      container.innerHTML = categories.map(cat => `
+        <button type="button" onclick="selectCategory('${cat}')" class="px-3.5 py-1.5 rounded-xl text-xs font-bold transition ${state.activeCategory === cat ? 'bg-amber-500 text-slate-900 shadow' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'} cursor-pointer">
+          ${cat}
+        </button>
+      `).join('');
+    }
+
+    function selectCategory(cat) {
+      state.activeCategory = cat;
+      renderMenuCategories();
+      renderMenuList();
+    }
+
+    function renderMenuList() {
+      const container = document.getElementById('menu-list-container');
+      if (!container) return;
+
+      const filtered = state.activeCategory === 'すべて' 
+        ? allMenus 
+        : allMenus.filter(m => m.category === state.activeCategory);
+
+      if (filtered.length === 0) {
+        container.innerHTML = '<p class="text-xs text-gray-400 py-4 text-center">該当メニューはありません。</p>';
+        return;
+      }
+
+      container.innerHTML = filtered.map(m => {
+        const isChecked = state.selectedMenuIds.includes(m.id);
+        return `
+          <div onclick="toggleMenuSelect(${m.id})" class="p-4 rounded-2xl border transition cursor-pointer flex justify-between items-center ${isChecked ? 'border-amber-500 bg-amber-50/50 shadow-sm' : 'border-gray-200 hover:border-amber-300 bg-white'}">
+            <div class="flex items-start gap-3">
+              <input type="checkbox" ${isChecked ? 'checked' : ''} class="mt-1 w-4 h-4 accent-amber-500 rounded cursor-pointer">
+              <div>
+                <span class="text-[10px] font-bold text-amber-700 bg-amber-100 px-2 py-0.5 rounded-md inline-block mb-1">${m.category}</span>
+                <h4 class="font-bold text-sm text-gray-800">${m.name}</h4>
+                <p class="text-xs text-gray-500 mt-0.5">${m.desc || ''}</p>
+                <div class="text-xs text-gray-400 mt-1"><i class="fa-regular fa-clock"></i> 所要時間: 約 ${m.time} 分</div>
+              </div>
+            </div>
+            <div class="text-right font-bold text-slate-900 text-sm">
+              ¥${m.price.toLocaleString()}
+            </div>
+          </div>
+        `;
+      }).join('');
+
+      updateBookingSummary();
+    }
+
+    function toggleMenuSelect(id) {
+      const idx = state.selectedMenuIds.indexOf(id);
+      if (idx > -1) {
+        state.selectedMenuIds.splice(idx, 1);
+      } else {
+        state.selectedMenuIds.push(id);
+      }
+      renderMenuList();
+    }
+
+    function updateBookingSummary() {
+      const selected = allMenus.filter(m => state.selectedMenuIds.includes(m.id));
+      const totalTime = selected.reduce((sum, m) => sum + m.time, 0);
+      const totalPrice = selected.reduce((sum, m) => sum + m.price, 0);
+
+      document.getElementById('selected-count').innerText = selected.length;
+      document.getElementById('total-time').innerText = totalTime;
+      document.getElementById('total-price').innerText = totalPrice.toLocaleString();
+
+      const btnEl = document.getElementById('to-calendar-btn');
+      if (selected.length > 0) {
+        btnEl.disabled = false;
+        btnEl.className = "w-full mt-4 py-4 bg-amber-500 hover:bg-amber-600 text-slate-900 font-bold rounded-2xl text-base transition shadow-md cursor-pointer";
+        btnEl.innerText = "📅 日付・時間を選択する";
+      } else {
+        btnEl.disabled = true;
+        btnEl.className = "w-full mt-4 py-4 bg-gray-200 text-gray-400 font-bold rounded-2xl text-base transition cursor-not-allowed shadow-sm";
+        btnEl.innerText = "📅 日付を選ぶ (先に上のメニューにチェックを入れてください)";
+      }
+    }
+
+    function openCalendarModal() {
+      document.getElementById('calendar-modal').classList.remove('hidden');
+      renderCalendar();
+    }
+
+    function closeCalendarModal() {
+      document.getElementById('calendar-modal').classList.add('hidden');
+    }
+
+    function applyBookingSettings() {
+      const b = state.booking;
+      const set = (id, v) => { const el = document.getElementById(id); if (el) el.value = v; };
+      set('set-times', b.timeSlots.join(', ')); set('set-min', b.minDays); set('set-max', b.maxDays); set('set-cancel', b.cancelDays);
+    }
+    function saveBookingSettings(e) {
+      e.preventDefault();
+      const times = [...new Set(document.getElementById('set-times').value.split(/[,、\s]+/).filter(Boolean).map(s => {
+        const m = s.match(/^(\d{1,2}):(\d{2})$/);
+        return m && +m[1] < 24 && +m[2] < 60 ? String(m[1]).padStart(2, '0') + ':' + m[2] : null;
+      }))].sort();
+      if (!times.length || times.includes(null)) { notify('時間は「09:30, 11:00」のように、半角で入力してください。'); return; }
+      const n = (id, lo, hi) => Math.min(hi, Math.max(lo, parseInt(document.getElementById(id).value, 10) || 0));
+      state.booking = { timeSlots: times, minDays: n('set-min', 0, 60), maxDays: n('set-max', 1, 400), cancelDays: n('set-cancel', 0, 30) };
+      timeSlots = times;
+      cloud.set('rhp_booking_settings_nocoup', JSON.stringify(state.booking));
+      applyBookingSettings(); renderAdminCalendar();
+      showToast('✅ 保存完了', '予約の受付ルールを保存しました。');
+    }
+
+    let bookMonth = null;
+    function changeBookMonth(n) { bookMonth = new Date(bookMonth.getFullYear(), bookMonth.getMonth() + n, 1); renderCalendar(); }
+    function renderCalendar() {
+      const c = document.getElementById('calendar-grid-container');
+      const today = new Date(); today.setHours(0, 0, 0, 0);
+      const minD = new Date(today); minD.setDate(minD.getDate() + state.booking.minDays);
+      const maxD = new Date(today); maxD.setDate(maxD.getDate() + state.booking.maxDays);
+      const minM = new Date(minD.getFullYear(), minD.getMonth(), 1);
+      if (!bookMonth || bookMonth < minM) bookMonth = minM;
+      const y = bookMonth.getFullYear(), m = bookMonth.getMonth();
+      const first = new Date(y, m, 1).getDay(), days = new Date(y, m + 1, 0).getDate();
+      const canPrev = new Date(y, m - 1, 1) >= minM, canNext = new Date(y, m + 1, 1) <= maxD;
+      const nav = (ok, n, ch) => `<button type="button" ${ok ? `onclick="changeBookMonth(${n})"` : 'disabled'} class="w-10 h-10 rounded-xl font-bold ${ok ? 'bg-gray-100 cursor-pointer' : 'bg-gray-50 text-gray-300'}">${ch}</button>`;
+      let html = `<div class="flex items-center justify-between mb-2">${nav(canPrev, -1, '‹')}<div class="font-bold text-sm">${y}年${m + 1}月</div>${nav(canNext, 1, '›')}</div>
+        <div class="grid grid-cols-7 gap-1 text-center font-bold text-xs mb-1 text-gray-500">${['日', '月', '火', '水', '木', '金', '土'].map(w => `<div>${w}</div>`).join('')}</div><div class="grid grid-cols-7 gap-1 text-xs">`;
+      for (let i = 0; i < first; i++) html += '<div></div>';
+      for (let d = 1; d <= days; d++) {
+        const dt = new Date(y, m, d), s = ymd(dt), dow = dt.getDay();
+        const cell = (cls, sub, click) => `<${click ? 'button type="button" onclick="selectDate(\'' + s + '\')"' : 'div'} class="h-12 border rounded-xl font-bold flex flex-col items-center justify-center ${cls}"><span>${d}</span><span class="text-[9px]">${sub}</span></${click ? 'button' : 'div'}>`;
+        if (dt < minD || dt > maxD) html += cell('bg-white text-gray-300 border-transparent', '', false);
+        else if (isClosedDay(s)) html += cell('bg-gray-100 text-gray-400', '休業', false);
+        else if (Object.keys(state.slots).filter(k => k.startsWith(s + '_')).length >= dayTimes(s).length) html += cell('bg-gray-100 text-gray-400', '満席', false);
+        else html += cell('bg-amber-50 hover:bg-amber-400 border-amber-300 text-gray-800 cursor-pointer', '<span class="text-emerald-600">空あり</span>', true);
+      }
+      c.innerHTML = html + '</div>';
+    }
+
+    function selectDate(dateStr) {
+      state.selectedDate = dateStr;
+      closeCalendarModal();
+      document.getElementById('modal-selected-date-display').innerText = dateStr;
+      document.getElementById('time-modal').classList.remove('hidden');
+
+      const timeContainer = document.getElementById('time-slots-list');
+      const dur = selectedDuration();
+      timeContainer.innerHTML = dayTimes(dateStr).map(t => !isSlotFree(dateStr, t, dur) ? `
+        <div class="p-3 bg-gray-200 text-gray-400 font-bold rounded-xl text-center">${t} 〜<div class="text-[10px]">予約不可</div></div>
+      ` : `
+        <button type="button" onclick="selectTime('${t}')" class="p-3 bg-slate-900 text-amber-400 font-bold rounded-xl text-center hover:bg-slate-800 cursor-pointer shadow">
+          ${t} 〜
+        </button>
+      `).join('');
+    }
+
+    function closeTimeModal() {
+      document.getElementById('time-modal').classList.add('hidden');
+    }
+
+    function selectTime(timeStr) {
+      state.selectedTime = timeStr;
+      closeTimeModal();
+      const selectedNames = allMenus.filter(m => state.selectedMenuIds.includes(m.id)).map(m => m.name).join(' / ');
+      document.getElementById('display-selected-summary').innerText = `${state.selectedDate} ${state.selectedTime}〜 (${selectedNames})`;
+      document.getElementById('booking-step4-container').classList.remove('hidden');
+      document.getElementById('booking-step4-container').scrollIntoView({ behavior: 'smooth' });
+    }
+
+    const slotMin = t => parseInt(t.slice(0, 2), 10) * 60 + parseInt(t.slice(3), 10);
+    const slotKey = (d, t) => d + '_' + t.replace(':', '');
+    function selectedDuration() { return allMenus.filter(m => state.selectedMenuIds.includes(m.id)).reduce((s, m) => s + (Number(m.time) || 0), 0) || 30; }
+    function coveredTimes(t, dur) { const s = slotMin(t); return [...new Set([...timeSlots, ...grid30()])].filter(x => { const m = slotMin(x); return m >= s && m < s + dur; }).sort(); }
+    function isSlotFree(date, t, dur) { return coveredTimes(t, dur).every(x => !state.slots[slotKey(date, x)]); }
+    function newCode() { const a = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; let s = ''; const r = crypto.getRandomValues(new Uint8Array(12)); r.forEach(v => { s += a[v % a.length]; }); return s; }
+    const fmtCode = c => c.replace(/(.{4})(?=.)/g, '$1-');
+
+    async function submitBooking(e) {
+      e.preventDefault();
+      const name = document.getElementById('book-name').value;
+      const phone = document.getElementById('book-phone').value;
+      const email = document.getElementById('book-email').value;
+      const dur = selectedDuration();
+      if (!isSlotFree(state.selectedDate, state.selectedTime, dur)) {
+        showToast('⚠️ 予約不可', 'その時間はすでにご予約が入っています。別の時間をお選びください。');
+        return;
+      }
+      const times = coveredTimes(state.selectedTime, dur);
+      const keys = times.map(t => slotKey(state.selectedDate, t));
+      const selectedNames = allMenus.filter(m => state.selectedMenuIds.includes(m.id)).map(m => m.name).join(' / ');
+      const rid = newCode();
+      const data = {
+        id: Math.floor(100000 + Math.random() * 900000), name, phone, email,
+        date: state.selectedDate, time: state.selectedTime, menu: selectedNames,
+        note: (document.getElementById('book-note').value || '').trim().slice(0, 300),
+        dur, slots: keys, createdAt: Date.now()
+      };
+      try {
+        await cloud.book(rid, data, keys);
+      } catch (err) {
+        console.error(err);
+        showToast('⚠️ 予約できませんでした', 'その時間は埋まったか、通信エラーです。時間を選び直してください。');
+        return;
+      }
+      keys.forEach(k => { state.slots[k] = rid; });
+      showToast('🎉 予約完了', `${name} 様、ご予約を承りました！\n予約コード: ${fmtCode(rid)}\n確認・キャンセルに必要です。画面を保存してください。`);
+      state.selectedMenuIds = [];
+      document.getElementById('book-note').value = '';
+      document.getElementById('booking-step4-container').classList.add('hidden');
+      renderMenuList();
+    }
+
+    function loadPastBooking() {
+      const phone = document.getElementById('repeat-phone-input').value.trim();
+      const past = state.reservations.find(r => r.phone === phone);
+      if (past) {
+        showToast('ご予約履歴発見', `過去の予約 (${past.menu}) のメニューを選択状態にセットしました！`);
+      } else {
+        notify('該当する電話番号の過去予約は見つかりませんでした。');
+      }
+    }
+
+    function copySourceCode() {
+      const fullHtml = document.documentElement.outerHTML;
+      fallbackCopy(fullHtml);
+    }
+
+    function fallbackCopy(text) {
+      const textArea = document.createElement("textarea");
+      textArea.value = text;
+      document.body.appendChild(textArea);
+      textArea.select();
+      try {
+        document.execCommand('copy');
+        showToast("✅ コピー完了", "コードをクリップボードにコピーしました！");
+      } catch (err) {
+        notify("コピーできませんでした。");
+      }
+      document.body.removeChild(textArea);
+    }
+
+    function renderAdminMenuList() {
+      const container = document.getElementById('admin-menu-list');
+      if (!container) return;
+
+      container.innerHTML = allMenus.map(m => `
+        <div class="p-3 border rounded-xl bg-gray-50 flex justify-between items-center gap-2 text-xs">
+          <div class="min-w-0 flex-1 break-words">
+            <span class="font-bold text-amber-600 font-mono">[${m.category}]</span> 
+            <strong class="text-gray-800 ml-1">${m.name}</strong> 
+            <span class="text-gray-500">(${m.time}分)</span>
+            <div class="text-emerald-700 font-bold mt-0.5">¥${m.price.toLocaleString()}</div>
+          </div>
+          <div class="flex gap-1 shrink-0">
+            <button type="button" onclick="editAdminMenu(${m.id})" class="w-12 py-1.5 text-center whitespace-nowrap bg-amber-500 text-slate-900 font-bold rounded-lg cursor-pointer">編集</button>
+            <button type="button" onclick="deleteAdminMenu(${m.id})" class="w-12 py-1.5 text-center whitespace-nowrap bg-red-500 text-white font-bold rounded-lg cursor-pointer">削除</button>
+          </div>
+        </div>
+      `).join('');
+    }
+
+    function saveAdminMenu(e) {
+      e.preventDefault();
+      const idVal = document.getElementById('edit-menu-id').value;
+      const cat = document.getElementById('menu-form-cat').value;
+      const name = document.getElementById('menu-form-name').value;
+      const price = parseInt(document.getElementById('menu-form-price').value);
+      const time = parseInt(document.getElementById('menu-form-time').value);
+      const desc = document.getElementById('menu-form-desc').value;
+
+      if (idVal) {
+        const target = allMenus.find(m => m.id === parseInt(idVal));
+        if (target) {
+          target.category = cat;
+          target.name = name;
+          target.price = price;
+          target.time = time;
+          target.desc = desc;
+        }
+      } else {
+        allMenus.push({ id: Date.now(), category: cat, name, price, time, desc });
+      }
+
+      cloud.set('rhp_custom_menus_nocoup', JSON.stringify(allMenus));
+      resetMenuForm();
+      renderMenuList();
+      renderAdminMenuList();
+      showToast('保存完了', 'メニューを保存しました！');
+    }
+
+    function editAdminMenu(id) {
+      const m = allMenus.find(item => item.id === id);
+      if (!m) return;
+      document.getElementById('edit-menu-id').value = m.id;
+      document.getElementById('menu-form-cat').value = m.category;
+      document.getElementById('menu-form-name').value = m.name;
+      document.getElementById('menu-form-price').value = m.price;
+      document.getElementById('menu-form-time').value = m.time;
+      document.getElementById('menu-form-desc').value = m.desc || '';
+      document.getElementById('menu-form-submit-btn').innerText = "✓ メニューを更新する";
+      document.getElementById('menu-form-cancel-btn').classList.remove('hidden');
+    }
+
+    function resetMenuForm() {
+      document.getElementById('edit-menu-id').value = '';
+      document.getElementById('menu-form-name').value = '';
+      document.getElementById('menu-form-price').value = '';
+      document.getElementById('menu-form-time').value = '';
+      document.getElementById('menu-form-desc').value = '';
+      document.getElementById('menu-form-submit-btn').innerText = "＋ メニューを追加する";
+      document.getElementById('menu-form-cancel-btn').classList.add('hidden');
+    }
+
+    async function deleteAdminMenu(id) {
+      if (!(await askDialog({ title: 'このメニューを削除しますか？', ok: '削除する' }))) return;
+      allMenus = allMenus.filter(m => m.id !== id);
+      cloud.set('rhp_custom_menus_nocoup', JSON.stringify(allMenus));
+      renderMenuList();
+      renderAdminMenuList();
+      showToast('削除完了', 'メニューを削除しました。');
+    }
+
+    function filterReservationsByPeriod(period) {
+      currentFilterPeriod = period;
+      ['all', 'today', 'week'].forEach(p => {
+        const btn = document.getElementById(`btn-filter-${p}`);
+        if (btn) {
+          if (p === period) {
+            btn.className = "px-2.5 py-1 rounded-lg font-bold bg-amber-500 text-slate-900 shadow-sm cursor-pointer";
+          } else {
+            btn.className = "px-2.5 py-1 rounded-lg font-bold bg-white text-gray-700 border hover:bg-gray-100 cursor-pointer";
+          }
+        }
+      });
+      renderReservations();
+    }
+
+    function generateWeeklyReminderList() {
+      const today = new Date();
+      const nextWeek = new Date();
+      nextWeek.setDate(today.getDate() + 7);
+
+      const weeklyRes = state.reservations.filter(r => {
+        const d = new Date(r.date);
+        return d >= today && d <= nextWeek;
+      });
+
+      const outputEl = document.getElementById('weekly-reminder-output');
+      outputEl.classList.remove('hidden');
+
+      if (weeklyRes.length === 0) {
+        outputEl.innerHTML = '<div class="p-3 bg-white border rounded-xl text-xs text-gray-500">直近1週間のご予約者はいません。</div>';
+        return;
+      }
+
+      const template = document.getElementById('email-template-textarea').value;
+      outputEl.innerHTML = weeklyRes.map(r => {
+        const text = template
+          .replace(/{name}/g, r.name)
+          .replace(/{date}/g, r.date)
+          .replace(/{time}/g, r.time)
+          .replace(/{menu}/g, r.menu)
+          .replace(/{id}/g, r.id);
+        
+        return `
+          <div class="p-3 bg-white border rounded-xl text-xs space-y-2">
+            <div class="font-bold text-gray-800 flex justify-between items-center">
+              <span>${r.date} ${r.time}〜 : ${r.name} 様</span>
+              <button type="button" onclick="fallbackCopy(\`${text.replace(/`/g, '\\`')}\`)" class="px-2.5 py-1 bg-amber-500 text-slate-900 font-bold rounded-lg shadow-sm hover:bg-amber-400">
+                文面をコピー
+              </button>
+            </div>
+            <pre class="bg-gray-50 p-2 rounded border text-[11px] text-gray-600 whitespace-pre-wrap font-sans">${text}</pre>
+            ${r.email ? `<a href="mailto:${esc(r.email)}?subject=${encodeURIComponent('【RHP hair design】ご予約のご確認')}&body=${encodeURIComponent(text)}" class="inline-block px-3 py-1.5 bg-slate-800 text-white font-bold rounded-lg text-[11px]">✉ メールアプリで開く</a>` : ''}
+          </div>
+        `;
+      }).join('');
+    }
+
+    function ymd(d) { return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0'); }
+    function esc(s) { return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
+    let calMonth = new Date(new Date().getFullYear(), new Date().getMonth(), 1);
+    let calSelected = ymd(new Date());
+    function askDialog({ title, message = '', input = false, initial = '', placeholder = '', ok = 'OK', single = false }) {
+      return new Promise(resolve => {
+        const wrap = document.createElement('div');
+        wrap.style.cssText = 'position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;padding:16px;background:rgba(0,0,0,.5)';
+        wrap.innerHTML = `<div class="w-full max-w-sm bg-white rounded-2xl p-5 shadow-xl space-y-3">
+          <div class="font-bold text-sm text-gray-800 break-words">${esc(title)}</div>
+          ${message ? `<p class="text-xs text-gray-600 whitespace-pre-line break-words">${esc(message)}</p>` : ''}
+          ${input ? `<input type="text" class="dlg-input w-full p-3 border rounded-xl text-sm bg-gray-50" placeholder="${esc(placeholder)}" value="${esc(initial)}">` : ''}
+          <div class="flex gap-2">
+            ${single ? '' : '<button type="button" class="dlg-cancel flex-1 py-2.5 bg-gray-200 text-gray-700 font-bold rounded-xl text-xs">やめる</button>'}
+            <button type="button" class="dlg-ok flex-1 py-2.5 bg-slate-900 text-white font-bold rounded-xl text-xs">${esc(ok)}</button>
+          </div></div>`;
+        document.body.appendChild(wrap);
+        const done = v => { wrap.remove(); resolve(v); };
+        const cancelBtn = wrap.querySelector('.dlg-cancel'); if (cancelBtn) cancelBtn.onclick = () => done(null);
+        const inp = wrap.querySelector('.dlg-input');
+        wrap.querySelector('.dlg-ok').onclick = () => done(inp ? inp.value : true);
+        if (inp) inp.focus();
+      });
+    }
+    const errText = e => String((e && (e.code || e.message)) || e);
+    function notify(msg) { return askDialog({ title: 'お知らせ', message: String(msg), single: true, ok: 'OK' }); }
+    function isClosedDay(s) {
+      if (state.customHolidays.includes(s)) return true;
+      if (state.dayHours[s]) return false;
+      const dow = new Date(s + 'T00:00:00').getDay();
+      return dow === 1 || dow === 2;
+    }
+    const toHHMM = m => String(Math.floor(m / 60)).padStart(2, '0') + ':' + String(m % 60).padStart(2, '0');
+    function grid30() { const a = []; for (let m = 360; m <= 1410; m += 30) a.push(toHHMM(m)); return a; }
+    function dayTimes(s) {
+      const o = state.dayHours[s];
+      if (!o) return timeSlots;
+      const a = [];
+      for (let m = slotMin(o.from); m <= slotMin(o.to); m += 30) a.push(toHHMM(m));
+      return a;
+    }
+    function saveDayRules(msg) {
+      cloud.set('rhp_custom_holidays_nocoup', JSON.stringify(state.customHolidays));
+      cloud.set('rhp_day_hours_nocoup', JSON.stringify(state.dayHours));
+      window.refreshApp();
+      if (msg) showToast('✅ 保存完了', msg);
+    }
+    async function closeDay(s) {
+      if (state.reservations.some(r => r.date === s) && !(await askDialog({ title: 'この日はすでにご予約があります', message: '休みにしても、ご予約は消えません。休みにしますか？', ok: '休みにする' }))) return;
+      if (!state.customHolidays.includes(s)) state.customHolidays.push(s);
+      delete state.dayHours[s];
+      saveDayRules(s + ' を休みにしました。お客様の予約画面では「休業」になります。');
+    }
+    function openDay(s) {
+      state.customHolidays = state.customHolidays.filter(x => x !== s);
+      if (isClosedDay(s)) state.dayHours[s] = { from: timeSlots[0], to: timeSlots[timeSlots.length - 1] };
+      saveDayRules(s + ' を営業日にしました。');
+    }
+    async function setDayHours(s) {
+      const cur = state.dayHours[s] ? state.dayHours[s].from + '-' + state.dayHours[s].to : timeSlots[0] + '-' + timeSlots[timeSlots.length - 1];
+      const v = await askDialog({ title: s + ' の営業時間', message: '予約を受ける「最初の時刻-最後の開始時刻」を入力してください。30分おきの枠ができます。\n例：10:00-17:00（17:00開始まで受付）\n通常の時間より遅い時間（20:00など）も、ここで追加できます。', input: true, initial: cur, ok: '保存' });
+      if (v === null) return;
+      const m = v.trim().match(/^(\d{1,2}):(\d{2})\s*[-〜~ー－]\s*(\d{1,2}):(\d{2})$/);
+      if (!m) { notify('「10:00-17:00」のように、半角で入力してください。'); return; }
+      const pad = (a, b) => String(a).padStart(2, '0') + ':' + b;
+      const from = pad(m[1], m[2]), to = pad(m[3], m[4]);
+      if (from > to) { notify('最初の時刻は、最後の時刻より前にしてください。'); return; }
+      state.dayHours[s] = { from, to };
+      state.customHolidays = state.customHolidays.filter(x => x !== s);
+      saveDayRules(s + ' の営業時間を ' + from + '〜' + to + ' にしました（お客様の予約画面の時間は ' + dayTimes(s).length + ' 枠）。');
+    }
+    function resetDay(s) { delete state.dayHours[s]; saveDayRules(s + ' の営業時間を通常に戻しました。'); }
+    function changeCalMonth(n) { calMonth = new Date(calMonth.getFullYear(), calMonth.getMonth() + n, 1); renderAdminCalendar(); }
+    function selectCalDay(s) { calSelected = s; renderAdminCalendar(); }
+
+    function renderAdminCalendar() {
+      const el = document.getElementById('admin-calendar');
+      if (!el) return;
+      const y = calMonth.getFullYear(), m = calMonth.getMonth();
+      const first = new Date(y, m, 1).getDay(), days = new Date(y, m + 1, 0).getDate();
+      const todayS = ymd(new Date());
+      const cnt = {};
+      state.reservations.forEach(r => { cnt[r.date] = (cnt[r.date] || 0) + 1; });
+      let h = `<div class="bg-white border rounded-2xl p-3 shadow-sm">
+        <div class="flex items-center justify-between mb-2">
+          <button type="button" onclick="changeCalMonth(-1)" class="w-10 h-10 rounded-xl bg-gray-100 font-bold cursor-pointer">‹</button>
+          <div class="font-bold text-sm">${y}年${m + 1}月</div>
+          <button type="button" onclick="changeCalMonth(1)" class="w-10 h-10 rounded-xl bg-gray-100 font-bold cursor-pointer">›</button>
+        </div>
+        <div class="grid grid-cols-7 text-center text-[10px] font-bold text-gray-500 mb-1">${['日', '月', '火', '水', '木', '金', '土'].map((w, i) => `<div class="${i === 0 ? 'text-red-500' : i === 6 ? 'text-blue-500' : ''}">${w}</div>`).join('')}</div>
+        <div class="grid grid-cols-7 gap-1">`;
+      for (let i = 0; i < first; i++) h += '<div></div>';
+      for (let d = 1; d <= days; d++) {
+        const dt = new Date(y, m, d), s = ymd(dt), dow = dt.getDay();
+        const closed = isClosedDay(s);
+        const n = cnt[s] || 0;
+        const cls = s === calSelected ? 'bg-amber-400 border-amber-500 text-slate-900' : (closed ? 'bg-gray-100 text-gray-400' : 'bg-white');
+        h += `<button type="button" onclick="selectCalDay('${s}')" class="h-12 border rounded-xl text-xs font-bold flex flex-col items-center justify-center cursor-pointer ${cls} ${s === todayS ? 'ring-2 ring-slate-900' : ''}"><span>${d}</span>${n ? `<span class="mt-0.5 px-1.5 rounded-full bg-emerald-600 text-white text-[10px] leading-4">${n}件</span>` : (closed ? '<span class="text-[9px]">休</span>' : '')}</button>`;
+      }
+      h += '</div></div>';
+      const dayRes = state.reservations.filter(r => r.date === calSelected);
+      const closedNow = isClosedDay(calSelected);
+      const times = [...new Set([...(closedNow ? [] : dayTimes(calSelected)), ...dayRes.map(r => r.time)])].sort();
+      const row = (t, inner, cls) => `<div class="flex gap-2 items-start text-xs p-2.5 rounded-xl border ${cls}"><div class="font-bold w-12 shrink-0 pt-1">${esc(t)}</div>${inner}</div>`;
+      const btn = (cls, onclick, label) => `<button type="button" onclick="${onclick}" class="shrink-0 px-2.5 py-1.5 font-bold rounded-lg cursor-pointer ${cls}">${label}</button>`;
+      const dctl = closedNow
+        ? btn('bg-emerald-600 text-white', `openDay('${calSelected}')`, '営業日にする')
+        : btn('bg-red-100 text-red-600', `closeDay('${calSelected}')`, '休みにする') + btn('bg-slate-800 text-white', `setDayHours('${calSelected}')`, '営業時間を変更') + (state.dayHours[calSelected] ? btn('bg-gray-200 text-gray-700', `resetDay('${calSelected}')`, '通常に戻す') : '');
+      const hoursNote = state.dayHours[calSelected] ? `<p class="text-[11px] text-slate-700 mb-1">この日の営業時間：${esc(state.dayHours[calSelected].from)}〜${esc(state.dayHours[calSelected].to)}（最後の開始時刻）</p>` : '';
+      h += `<div class="mt-3 bg-white border rounded-2xl p-3 shadow-sm"><div class="font-bold text-sm mb-1">${calSelected} のご予約${closedNow ? '（休業日）' : ''}</div><div class="flex flex-wrap gap-1.5 mb-2">${dctl}</div>${hoursNote}<p class="text-[10px] text-gray-500 mb-2">ホットペッパー等で埋まった時間は「消し込み」を押すと、こちらの予約画面でも埋まります。</p><div class="space-y-1.5">` + times.map(t => {
+        const rs = dayRes.filter(r => r.time === t);
+        if (rs.length) return rs.map(r => row(t, `<div class="min-w-0 flex-1 break-words"><div class="font-bold">${esc(r.name)} 様 <span class="font-normal text-gray-500">(${esc(r.phone || '電話番号なし')})</span>${r.source ? ` <span class="text-[10px] font-normal px-1.5 py-0.5 rounded bg-slate-200">${esc(r.source)}</span>` : ''}</div><div class="text-gray-600">${esc(r.menu)}${r.dur ? `（${r.dur}分）` : ''}</div>${r.note ? `<div class="text-amber-700">📝 ${esc(r.note)}</div>` : ''}</div>` + btn('bg-red-100 text-red-600', `deleteReservation(${r.id})`, '削除'), 'bg-amber-50 border-amber-200')).join('');
+        const k = slotKey(calSelected, t), v = state.slots[k];
+        if (v === 'BLOCK') return row(t, `<div class="flex-1 min-w-0 break-words pt-1 text-slate-700">🚫 消し込み済み ${esc(state.blocks[k] || '')}</div>` + btn('bg-gray-200 text-gray-700', `unblockSlot('${calSelected}','${t}')`, '解除'), 'bg-slate-100 border-slate-300');
+        if (v) return row(t, '<div class="flex-1 pt-1 text-gray-400">↑ ご予約の施術中</div>', 'bg-gray-50 text-gray-400');
+        return row(t, '<div class="flex-1 pt-1 text-gray-400">空き</div><div class="flex gap-1.5 shrink-0">' + btn('bg-amber-500 text-slate-900', `addPhoneBooking('${calSelected}','${t}')`, '予約を入れる') + btn('bg-slate-800 text-white', `blockSlot('${calSelected}','${t}')`, '消し込み') + '</div>', 'bg-white text-gray-500');
+      }).join('') + '</div></div>';
+      el.innerHTML = h;
+    }
+
+    function openSheet(inner) {
+      const wrap = document.createElement('div');
+      wrap.style.cssText = 'position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;padding:16px;background:rgba(0,0,0,.5)';
+      wrap.innerHTML = `<div class="w-full max-w-sm bg-white rounded-2xl p-5 shadow-xl space-y-3" style="max-height:90vh;overflow-y:auto">${inner}</div>`;
+      document.body.appendChild(wrap);
+      return wrap;
+    }
+    const sheetButtons = ok => `<div class="flex gap-2"><button type="button" class="sh-cancel flex-1 py-2.5 bg-gray-200 text-gray-700 font-bold rounded-xl text-xs">やめる</button><button type="button" class="sh-ok flex-1 py-2.5 bg-slate-900 text-white font-bold rounded-xl text-xs">${ok}</button></div>`;
+    const inputCls = 'w-full p-3 border rounded-xl text-sm bg-gray-50';
+
+    function blockSlot(date, t) {
+      const w = openSheet(`<div class="font-bold text-sm">消し込み　${esc(date)} ${esc(t)}〜</div>
+        <p class="text-xs text-gray-600">ホットペッパー等で埋まった時間を、こちらの予約画面でもふさぎます。</p>
+        <div class="flex items-center gap-2 text-xs"><span class="font-bold">ふさぐ時間</span><input type="number" class="bk-dur w-20 p-2 border rounded-xl" value="60" min="30" step="30"><span>分</span></div>
+        <input type="text" class="bk-memo ${inputCls}" maxlength="60" placeholder="メモ（任意）例：ホットペッパー 山田様">
+        ${sheetButtons('消し込む')}`);
+      w.querySelector('.sh-cancel').onclick = () => w.remove();
+      w.querySelector('.sh-ok').onclick = async () => {
+        const dur = Math.max(30, parseInt(w.querySelector('.bk-dur').value, 10) || 30);
+        const memo = w.querySelector('.bk-memo').value.trim().slice(0, 60);
+        const keys = coveredTimes(t, dur).map(x => slotKey(date, x));
+        try { await cloud.block(keys, date, memo); }
+        catch (err) { console.error(err); notify('消し込みできませんでした。すでに予約が入っている時間が含まれているか、通信エラーです。\n（' + errText(err) + '）'); return; }
+        w.remove();
+        showToast('🚫 消し込みました', `${date} ${t}〜 を ${dur}分ふさぎました。お客様の予約画面でも埋まります。`);
+      };
+    }
+    async function unblockSlot(date, t) {
+      if (!(await askDialog({ title: 'この消し込みを解除しますか？', message: '同じときに消し込んだ時間も、まとめて解除されます。', ok: '解除する' }))) return;
+      try { await cloud.unblock(slotKey(date, t)); } catch (err) { console.error(err); notify('解除できませんでした。\n（' + errText(err) + '）'); }
+    }
+
+    function addPhoneBooking(date, t) {
+      const w = openSheet(`<div class="font-bold text-sm">${esc(date)} ${esc(t)}〜　電話予約を入れる</div>
+        <input type="text" class="pb-name ${inputCls}" placeholder="お名前（必須）">
+        <input type="tel" class="pb-phone ${inputCls}" placeholder="電話番号（任意）">
+        <div class="text-xs font-bold text-gray-700">メニュー（複数選べます）</div>
+        <div class="pb-menus space-y-1.5 border rounded-xl p-2" style="max-height:180px;overflow-y:auto">${allMenus.map(m => `<label class="flex items-start gap-2 text-xs"><input type="checkbox" class="mt-0.5" value="${esc(m.name)}" data-time="${Number(m.time) || 0}"><span class="break-words">${esc(m.name)}（${Number(m.time) || 0}分）</span></label>`).join('')}</div>
+        <div class="flex items-center gap-2 text-xs"><span class="font-bold">所要時間</span><input type="number" class="pb-dur w-20 p-2 border rounded-xl" value="60" min="30" step="30"><span>分</span></div>
+        <input type="text" class="pb-note ${inputCls}" maxlength="300" placeholder="メモ（任意）">
+        ${sheetButtons('予約を入れる')}`);
+      const durEl = w.querySelector('.pb-dur');
+      w.querySelectorAll('.pb-menus input').forEach(cb => cb.addEventListener('change', () => {
+        const sum = [...w.querySelectorAll('.pb-menus input:checked')].reduce((s, c) => s + Number(c.dataset.time), 0);
+        if (sum) durEl.value = Math.ceil(sum / 30) * 30;
+      }));
+      w.querySelector('.sh-cancel').onclick = () => w.remove();
+      w.querySelector('.sh-ok').onclick = async () => {
+        const name = w.querySelector('.pb-name').value.trim();
+        if (!name) { notify('お名前を入力してください。'); return; }
+        const dur = Math.max(30, parseInt(durEl.value, 10) || 30);
+        if (!isSlotFree(date, t, dur)) { notify('その時間帯には、すでに予約か消し込みが入っています。時間を短くするか、別の時間にしてください。'); return; }
+        const keys = coveredTimes(t, dur).map(x => slotKey(date, x));
+        const menus = [...w.querySelectorAll('.pb-menus input:checked')].map(c => c.value).join(' / ');
+        const data = {
+          id: Math.floor(100000 + Math.random() * 900000), name, phone: w.querySelector('.pb-phone').value.trim(), email: '',
+          date, time: t, menu: menus || 'お電話でのご予約', note: w.querySelector('.pb-note').value.trim().slice(0, 300),
+          dur, slots: keys, source: '電話', createdAt: Date.now()
+        };
+        try { await cloud.book(newCode(), data, keys); }
+        catch (err) { console.error(err); notify('予約を入れられませんでした。その時間が埋まったか、通信エラーです。\n（' + errText(err) + '）'); return; }
+        w.remove();
+        showToast('✅ 電話予約を入れました', `${date} ${t}〜 ${name} 様（${dur}分）`);
+      };
+    }
+
+    function renderReservations() {
+      renderAdminCalendar();
+      const container = document.getElementById('admin-reservation-list');
+      if (!container) return;
+
+      const searchInput = document.getElementById('admin-res-search')?.value.trim().toLowerCase() || '';
+      let list = [...state.reservations];
+
+      const todayStr = ymd(new Date());
+      if (currentFilterPeriod === 'today') {
+        list = list.filter(r => r.date === todayStr);
+      } else if (currentFilterPeriod === 'week') {
+        const today = new Date();
+        const nextWeek = new Date();
+        nextWeek.setDate(today.getDate() + 7);
+        list = list.filter(r => {
+          const d = new Date(r.date);
+          return d >= today && d <= nextWeek;
+        });
+      }
+
+      if (searchInput) {
+        list = list.filter(r => 
+          r.name.toLowerCase().includes(searchInput) ||
+          r.phone.includes(searchInput) ||
+          String(r.id).includes(searchInput)
+        );
+      }
+
+      if (list.length === 0) {
+        container.innerHTML = '<p class="text-xs text-gray-400 py-3 text-center">現在該当するご予約データはありません。</p>';
+        return;
+      }
+
+      container.innerHTML = list.map(r => `
+        <div class="p-3.5 border rounded-2xl bg-white shadow-sm space-y-2 text-xs">
+          <div class="flex justify-between items-start flex-wrap gap-2">
+            <div>
+              <span class="font-bold text-amber-700 bg-amber-100 px-2 py-0.5 rounded text-[10px]">ID: #${r.id}</span>
+              <div class="font-bold text-gray-800 text-sm mt-1">${r.date} ${r.time}〜</div>
+              <div class="text-gray-700 font-bold">${r.name} 様 (${r.phone})</div>
+              <div class="text-gray-500">${r.menu}</div>
+              ${r.note ? `<div class="text-amber-700 mt-1">📝 ${esc(r.note)}</div>` : ''}
+            </div>
+            <button type="button" onclick="deleteReservation(${r.id})" class="px-3 py-1.5 bg-red-100 text-red-600 font-bold rounded-xl text-xs cursor-pointer">
+              削除
+            </button>
+          </div>
+          <div class="pt-2 border-t flex gap-2 items-center">
+            <button type="button" onclick="copyConfirmEmail(${r.id})" class="px-3 py-1.5 bg-amber-500 hover:bg-amber-400 text-slate-900 font-bold rounded-xl cursor-pointer shadow-sm flex items-center gap-1">
+              <i class="fa-solid fa-envelope"></i> 確認メール文面をコピー
+            </button>
+          </div>
+        </div>
+      `).join('');
+    }
+
+    function copyConfirmEmail(id) {
+      const r = state.reservations.find(item => item.id === id);
+      if (!r) return;
+      const template = document.getElementById('email-template-textarea').value;
+      const text = template
+        .replace(/{name}/g, r.name)
+        .replace(/{date}/g, r.date)
+        .replace(/{time}/g, r.time)
+        .replace(/{menu}/g, r.menu)
+        .replace(/{id}/g, r.id);
+      fallbackCopy(text);
+    }
+
+    async function deleteReservation(id) {
+      if (!(await askDialog({ title: 'このご予約を削除しますか？', ok: '削除する' }))) return;
+      const r = state.reservations.find(item => item.id === id);
+      if (!r) return;
+      try { await cloud.cancel(r.rid); } catch (err) { console.error(err); notify('削除できませんでした。\n（' + errText(err) + '）'); return; }
+      showToast('削除完了', '予約データを削除しました。');
+    }
+
+    function updateDashboard() {
+      const resCountEl = document.getElementById('dash-res-count');
+      if (resCountEl) resCountEl.innerText = `${state.reservations.length}件`;
+      const custCountEl = document.getElementById('dash-customer-count');
+      if (custCountEl) custCountEl.innerText = `${state.kartes.length}人`;
+
+      let total = 0;
+      state.reservations.forEach(r => {
+        allMenus.forEach(m => {
+          if (r.menu.includes(m.name)) total += m.price;
+        });
+      });
+      const salesTotalEl = document.getElementById('dash-sales-total');
+      if (salesTotalEl) salesTotalEl.innerText = `¥${total.toLocaleString()}`;
+    }
+
+    function renderNewsBanner() {
+      const banner = document.getElementById('news-banner-container');
+      if (state.newsSettings.active) {
+        document.getElementById('news-date-display').innerText = state.newsSettings.date;
+        document.getElementById('news-title-display').innerText = state.newsSettings.title;
+        document.getElementById('news-content-display').innerText = state.newsSettings.content;
+        banner.classList.remove('hidden');
+      } else {
+        banner.classList.add('hidden');
+      }
+    }
+
+    function renderNewsSettings() {
+      document.getElementById('news-edit-active').checked = state.newsSettings.active;
+      document.getElementById('news-edit-date').value = state.newsSettings.date || '';
+      document.getElementById('news-edit-title').value = state.newsSettings.title || '';
+      document.getElementById('news-edit-content').value = state.newsSettings.content || '';
+    }
+
+    function saveNewsSettings(e) {
+      e.preventDefault();
+      state.newsSettings = {
+        active: document.getElementById('news-edit-active').checked,
+        date: document.getElementById('news-edit-date').value,
+        title: document.getElementById('news-edit-title').value,
+        content: document.getElementById('news-edit-content').value
+      };
+      cloud.set('rhp_news_settings_nocoup', JSON.stringify(state.newsSettings));
+      renderNewsBanner();
+      showToast('✅ 更新完了', 'お知らせを保存しました！');
+    }
+
+    function clearNewsSettings() {
+      state.newsSettings = { active: false, date: '', title: '', content: '' };
+      cloud.set('rhp_news_settings_nocoup', JSON.stringify(state.newsSettings));
+      renderNewsSettings();
+      renderNewsBanner();
+      showToast('削除完了', 'お知らせを消去しました。');
+    }
+
+    function renderCustomHolidays() {
+      const container = document.getElementById('custom-holiday-list');
+      container.innerHTML = state.customHolidays.map(h => `
+        <span class="inline-flex items-center gap-1 px-3 py-1 bg-red-50 text-red-600 border border-red-200 rounded-xl font-bold">
+          ${h} <button type="button" onclick="removeCustomHoliday('${h}')" class="text-red-400 hover:text-red-700 ml-1">✕</button>
+        </span>
+      `).join('');
+    }
+
+    function addCustomHoliday() {
+      const val = document.getElementById('custom-holiday-input').value;
+      if (!val) return;
+      if (!state.customHolidays.includes(val)) {
+        state.customHolidays.push(val);
+        cloud.set('rhp_custom_holidays_nocoup', JSON.stringify(state.customHolidays));
+        renderCustomHolidays();
+      }
+    }
+
+    function removeCustomHoliday(val) {
+      state.customHolidays = state.customHolidays.filter(h => h !== val);
+      cloud.set('rhp_custom_holidays_nocoup', JSON.stringify(state.customHolidays));
+      renderCustomHolidays();
+    }
+
+    function renderKartes() {
+      const container = document.getElementById('karte-list');
+      if (state.kartes.length === 0) {
+        container.innerHTML = '<p class="text-xs text-gray-400">登録されたカルテはありません。</p>';
+        return;
+      }
+      container.innerHTML = state.kartes.map(k => `
+        <div class="p-3 border rounded-xl bg-gray-50 text-xs">
+          <div class="font-bold text-gray-800">${k.name} 様 (${k.phone})</div>
+          <p class="text-gray-600 mt-1">${k.memo}</p>
+        </div>
+      `).join('');
+    }
+
+    function saveCustomerKarte(e) {
+      e.preventDefault();
+      const name = document.getElementById('karte-name').value;
+      const phone = document.getElementById('karte-phone').value;
+      const memo = document.getElementById('karte-memo').value;
+
+      state.kartes.push({ name, phone, memo });
+      cloud.set('rhp_kartes_nocoup', JSON.stringify(state.kartes));
+      renderKartes();
+      updateDashboard();
+      showToast('保存完了', 'カルテを保存しました！');
+    }
+
+    async function searchCustomerBooking(e) {
+      e.preventDefault();
+      const code = document.getElementById('cancel-search-code').value.toUpperCase().replace(/[^A-Z0-9]/g, '');
+      const container = document.getElementById('cancel-result-container');
+      const listEl = document.getElementById('cancel-booking-list');
+      container.classList.remove('hidden');
+      let r = null;
+      try { r = code.length === 12 ? await cloud.getByCode(code) : null; } catch (err) { console.error(err); }
+      if (!r) {
+        listEl.innerHTML = '<p class="text-xs text-red-500 font-bold">該当するご予約が見つかりませんでした。コードをご確認ください。</p>';
+        return;
+      }
+      const today = new Date(); today.setHours(0, 0, 0, 0);
+      const days = Math.round((new Date(r.date + 'T00:00:00') - today) / 86400000);
+      const ok = days >= state.booking.cancelDays;
+      listEl.innerHTML = `
+        <div class="p-4 border rounded-2xl bg-amber-50/50 space-y-3">
+          <div class="text-xs min-w-0 break-words">
+            <div class="font-bold text-sm text-gray-800">${esc(r.date)} ${esc(r.time)}〜</div>
+            <div class="text-gray-600">${esc(r.menu)}</div>
+          </div>
+          ${ok ? `<button type="button" onclick="cancelBookingUser('${code}')" class="w-full py-2.5 bg-red-500 text-white font-bold rounded-xl text-xs shadow cursor-pointer">キャンセルする</button>
+          <p class="text-[11px] text-gray-500">日時を変えたいときは、このご予約をキャンセルして、あらためてご予約ください。</p>` : ''`<p class="text-xs text-red-600 font-bold">変更・キャンセルは予約日の${state.booking.cancelDays}日前までです。お手数ですが、お電話でご連絡ください。</p>`}
+        </div>`;
+    }
+
+    async function cancelBookingUser(code) {
+      if (!(await askDialog({ title: 'ご予約をキャンセルしますか？', ok: 'キャンセルする' }))) return;
+      try {
+        const ok = await cloud.cancel(code);
+        if (!ok) { showToast('見つかりません', 'すでにキャンセル済みか、コードが違います。'); return; }
+      } catch (err) { console.error(err); showToast('⚠️ 失敗', 'キャンセルできませんでした。通信状況をご確認ください。'); return; }
+      document.getElementById('cancel-booking-list').innerHTML = '';
+      document.getElementById('cancel-result-container').classList.add('hidden');
+      showToast('キャンセル完了', 'ご予約をキャンセルいたしました。');
+    }
+
+    function downloadCSV() {
+      let csv = '予約ID,お名前,電話番号,メールアドレス,予約日,予約時間,メニュー\n';
+      state.reservations.forEach(r => {
+        csv += `"${r.id}","${r.name}","${r.phone}","${r.email}","${r.date}","${r.time}","${r.menu}"\n`;
+      });
+      const blob = new Blob([new Uint8Array([0xEF, 0xBB, 0xBF]), csv], { type: 'text/csv;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `RHP_予約データ_${new Date().toISOString().split('T')[0]}.csv`;
+      a.click();
+    }
+
+    function syncStateFromCloud() {
+      const g = (k, d) => { try { const v = cloud.get(k); return v ? JSON.parse(v) : d; } catch (e) { return d; } };
+      state.customHolidays = g('rhp_custom_holidays_nocoup', []);
+      state.kartes = g('rhp_kartes_nocoup', []);
+      state.newsSettings = g('rhp_news_settings_nocoup', state.newsSettings);
+      state.heroSettings = g('rhp_hero_settings_nocoup', state.heroSettings);
+      state.booking = { ...DEFAULT_BOOKING, ...g('rhp_booking_settings_nocoup', {}) };
+      timeSlots = state.booking.timeSlots;
+      state.dayHours = g('rhp_day_hours_nocoup', {});
+    }
+    window.startApp = function () { syncStateFromCloud(); initSystem(); window.__started = true; };
+    window.refreshApp = function () { syncStateFromCloud(); initSystem(); };
+    setTimeout(function () { if (!window.__started) { window.startApp(); } }, 4000);
+  </script>
+
+  <script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+    import { getFirestore, collection, doc, setDoc, getDoc, getDocs, query, where, onSnapshot, runTransaction, writeBatch } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+
+    const app = initializeApp({
+      apiKey: "AIzaSyAwWDL4S1uD6S2t5s_QzF2VHoaysc3Hja0",
+      authDomain: "rhphairdesign-18b4d.firebaseapp.com",
+      projectId: "rhphairdesign-18b4d",
+      storageBucket: "rhphairdesign-18b4d.firebasestorage.app",
+      messagingSenderId: "414782690151",
+      appId: "1:414782690151:web:8f6751de61ff9bcea215c2"
+    });
+    const db = getFirestore(app);
+    const col = n => collection(db, n);
+    const cloud = window.cloud;
+    const adminKeys = ['rhp_kartes_nocoup'];
+    cloud.save = (key, val) => setDoc(doc(col(adminKeys.includes(key) ? 'admin' : 'appdata'), key), { value: val, updatedAt: Date.now() });
+
+    cloud.book = (rid, data, keys) => runTransaction(db, async tx => {
+      for (const k of keys) { if ((await tx.get(doc(col('slots'), k))).exists()) throw new Error('taken'); }
+      tx.set(doc(col('reservations'), rid), data);
+      keys.forEach(k => tx.set(doc(col('slots'), k), { rid, d: data.date, t: data.time }));
+    });
+    cloud.getByCode = async rid => { const s = await getDoc(doc(col('reservations'), rid)); return s.exists() ? s.data() : null; };
+    cloud.cancel = async rid => {
+      const s = await getDoc(doc(col('reservations'), rid));
+      if (!s.exists()) return false;
+      const b = writeBatch(db);
+      (s.data().slots || []).forEach(k => b.delete(doc(col('slots'), k)));
+      b.delete(doc(col('reservations'), rid));
+      await b.commit();
+      return true;
+    };
+
+    cloud.block = (keys, date, memo) => runTransaction(db, async tx => {
+      const grp = Math.random().toString(36).slice(2, 10);
+      for (const k of keys) { if ((await tx.get(doc(col('slots'), k))).exists()) throw new Error('taken'); }
+      keys.forEach(k => tx.set(doc(col('slots'), k), { rid: 'BLOCK', d: date, t: k.split('_')[1], memo, grp }));
+    });
+    cloud.unblock = async key => {
+      const ref = doc(col('slots'), key);
+      const s = await getDoc(ref);
+      if (!s.exists() || s.data().rid !== 'BLOCK') return;
+      const grp = s.data().grp;
+      const b = writeBatch(db);
+      if (grp) { (await getDocs(query(col('slots'), where('grp', '==', grp)))).forEach(d => b.delete(d.ref)); } else { b.delete(ref); }
+      await b.commit();
+    };
+
+    let adminOn = false;
+    window.subscribeAdmin = function () {
+      if (adminOn) return; adminOn = true;
+      onSnapshot(col('reservations'), snap => {
+        const a = []; snap.forEach(d => a.push({ ...d.data(), rid: d.id }));
+        a.sort((x, y) => (y.createdAt || 0) - (x.createdAt || 0));
+        cloud.setReservations(a);
+      }, err => { console.error(err); notify('予約データを読み込めません。\n（' + errText(err) + '）'); });
+      onSnapshot(col('admin'), snap => {
+        snap.forEach(d => { cloud.cache[d.id] = d.data().value; });
+        window.refreshApp();
+      }, err => console.error(err));
+    };
+
+    onSnapshot(col('slots'), snap => {
+      const m = {}, b = {};
+      snap.forEach(d => { const x = d.data(); m[d.id] = x.rid || 1; if (x.rid === 'BLOCK') b[d.id] = x.memo || ''; });
+      cloud.setSlots(m, b);
+    }, err => console.error(err));
+
+    let first = true;
+    onSnapshot(col('appdata'), snap => {
+      if (!first && snap.metadata.hasPendingWrites) return;
+      snap.forEach(d => { cloud.cache[d.id] = d.data().value; });
+      if (first) { first = false; window.startApp(); } else { window.refreshApp(); }
+    }, err => {
+      console.error(err);
+      notify('サーバーに接続できません。Firestoreの設定を確認してください。');
+      if (first) { first = false; window.startApp(); }
+    });
+  </script>
+
+  
+ </body></html>
