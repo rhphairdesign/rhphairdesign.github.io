@@ -850,7 +850,7 @@
         <!-- 予約の受付ルール -->
         <div class="bg-white rounded-3xl p-5 shadow-sm border">
           <h3 class="font-bold text-gray-800 mb-3 flex items-center gap-2">
-            <i class="fa-solid fa-sliders text-amber-600"></i> 予約の受付ルール <span class="text-[10px] font-normal text-gray-400">（版 11/25-f）</span>
+            <i class="fa-solid fa-sliders text-amber-600"></i> 予約の受付ルール <span class="text-[10px] font-normal text-gray-400">（版 11/25-h）</span>
           </h3>
           <form onsubmit="saveBookingSettings(event)" class="space-y-3 text-xs">
             <div>
@@ -1393,7 +1393,24 @@
   </div>
 
   <script>
-    const MAIL_URL = 'https://script.google.com/macros/s/AKfycbyrf2pKqXyXSygTZx8OPMVlfNwxeWdACX4FVGMIGpsvewfr71fJCCgTypvajhjDIsjCDA/exec';
+    const MAIL_URL = 'https://script.google.com/macros/s/AKfycbz5CgVs2GQrEM4HXDqFo1WD9HqrgvsGHHLhb1WKC1CiDZrsUf40A9UDu8SQCB1-gaS1NQ/exec';
+    async function sendMailWait(type, code) {
+      try {
+        const res = await fetch(MAIL_URL, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: JSON.stringify({ type, code }) });
+        return (await res.text()).trim();
+      } catch (e) { return 'unknown'; }
+    }
+    async function sendConfirmOne(rid) {
+      const r = state.reservations.find(x => x.rid === rid);
+      if (!r || !r.email) { notify('この予約にはメールアドレスがありません。'); return; }
+      if (!(await askDialog({ title: r.name + ' 様へ確認メールを送りますか？', message: r.email + ' に、ご予約の内容と予約コードをお送りします。', ok: '送る' }))) return;
+      const res = await sendMailWait('remind', rid);
+      if (res === 'ok') showToast('✅ 送信しました', r.name + ' 様へ確認メールを送りました。');
+      else if (res === 'wait') notify('同じお客様には、1時間に1回までしか送れません。しばらくしてからお試しください。');
+      else if (res === 'skip') notify('送信できませんでした。予約が見つからないか、読み込みに失敗しました。');
+      else if (res === 'unknown') showToast('送信をお願いしました', 'お客様に届くまで、数十秒かかります。（結果は確認できませんでした）');
+      else notify('送信できませんでした。\n（' + res + '）');
+    }
     function sendMail(type, code) {
       if (!MAIL_URL) return;
       try {
@@ -1938,7 +1955,7 @@
               </button>
             </div>
             <pre class="bg-gray-50 p-2 rounded border text-[11px] text-gray-600 whitespace-pre-wrap font-sans">${text}</pre>
-            ${r.email ? `<a href="mailto:${esc(r.email)}?subject=${encodeURIComponent('【RHP hair design】ご予約のご確認')}&body=${encodeURIComponent(text)}" class="inline-block px-3 py-1.5 bg-slate-800 text-white font-bold rounded-lg text-[11px]">✉ メールアプリで開く</a>` : ''}
+            ${r.email && r.rid ? `<button type="button" onclick="sendConfirmOne('${r.rid}')" class="mr-2 px-3 py-1.5 bg-slate-900 text-white font-bold rounded-lg text-[11px]">✉ ワンクリックで送る</button>` : ''}${r.email ? `<a href="mailto:${esc(r.email)}?subject=${encodeURIComponent('【RHP hair design】ご予約のご確認')}&body=${encodeURIComponent(text)}" class="inline-block px-3 py-1.5 bg-slate-800 text-white font-bold rounded-lg text-[11px]">✉ メールアプリで開く</a>` : ''}
           </div>
         `;
       }).join('');
@@ -2178,7 +2195,8 @@
               削除
             </button>
           </div>
-          <div class="pt-2 border-t flex gap-2 items-center">
+          <div class="pt-2 border-t flex flex-wrap gap-2 items-center">
+            ${r.email && r.rid ? `<button type="button" onclick="sendConfirmOne('${r.rid}')" class="px-3 py-1.5 bg-slate-900 text-white font-bold rounded-xl cursor-pointer shadow-sm">✉ 確認メールを送る</button>` : '<span class="text-[11px] text-gray-400">メール未登録</span>'}
             <button type="button" onclick="copyConfirmEmail(${r.id})" class="px-3 py-1.5 bg-amber-500 hover:bg-amber-400 text-slate-900 font-bold rounded-xl cursor-pointer shadow-sm flex items-center gap-1">
               <i class="fa-solid fa-envelope"></i> 確認メール文面をコピー
             </button>
