@@ -850,7 +850,7 @@
         <!-- 予約の受付ルール -->
         <div class="bg-white rounded-3xl p-5 shadow-sm border">
           <h3 class="font-bold text-gray-800 mb-3 flex items-center gap-2">
-            <i class="fa-solid fa-sliders text-amber-600"></i> 予約の受付ルール <span class="text-[10px] font-normal text-gray-400">（版 11/25-h）</span>
+            <i class="fa-solid fa-sliders text-amber-600"></i> 予約の受付ルール <span class="text-[10px] font-normal text-gray-400">（版 11/26-i）</span>
           </h3>
           <form onsubmit="saveBookingSettings(event)" class="space-y-3 text-xs">
             <div>
@@ -1368,9 +1368,9 @@
     <div class="bg-white rounded-3xl p-6 w-full max-w-sm shadow-2xl">
       <div class="text-center mb-4">
         <h3 class="font-bold text-gray-800">店舗管理ログイン</h3>
-        <p class="text-xs text-gray-500 mt-1">管理画面へのアクセス</p>
+        <p class="text-xs text-gray-500 mt-1">お店のパスワードを入力してください</p>
       </div>
-      <input type="password" id="admin-pin" placeholder="暗証番号を入力" class="w-full text-center text-xl tracking-widest p-3 border-2 border-amber-400 rounded-2xl mb-4 font-mono" onkeypress="if(event.key==='Enter') verifyAdminPin()">
+      <input type="password" id="admin-pin" placeholder="パスワードを入力" class="w-full text-center text-xl tracking-widest p-3 border-2 border-amber-400 rounded-2xl mb-4 font-mono" onkeypress="if(event.key==='Enter') verifyAdminPin()">
       <div class="flex gap-2">
         <button type="button" onclick="closeAdminAuth()" class="flex-1 py-3 bg-gray-200 text-gray-700 rounded-2xl text-xs font-bold cursor-pointer">キャンセル</button>
         <button type="button" onclick="verifyAdminPin()" class="flex-1 py-3 bg-amber-500 text-slate-900 rounded-2xl text-xs font-bold shadow cursor-pointer">認証</button>
@@ -1467,7 +1467,6 @@
     let allMenus = [];
     let currentFilterPeriod = 'all';
     const state = {
-      pin: "tina0422",
       slots: {},
       dayHours: {},
       blocks: {},
@@ -1506,6 +1505,7 @@
 }
 
     function openAdminAuth() {
+      if (cloud.isAdmin && cloud.isAdmin()) { showTab('admin'); if (window.subscribeAdmin) window.subscribeAdmin(); return; }
       document.getElementById('auth-modal').classList.remove('hidden');
     }
 
@@ -1513,19 +1513,24 @@
       document.getElementById('auth-modal').classList.add('hidden');
     }
 
-    function verifyAdminPin() {
-      const input = document.getElementById('admin-pin').value;
-      if (input === state.pin) {
-        closeAdminAuth();
-        showTab('admin');
-        if (window.subscribeAdmin) window.subscribeAdmin();
-        document.getElementById('admin-pin').value = '';
-      } else {
-        notify('暗証番号が正しくありません。');
+    async function verifyAdminPin() {
+      const pw = document.getElementById('admin-pin').value;
+      if (!pw) return;
+      try {
+        await cloud.login(pw);
+      } catch (err) {
+        console.error(err);
+        notify('ログインできませんでした。パスワードをご確認ください。\n（' + errText(err) + '）');
+        return;
       }
+      closeAdminAuth();
+      document.getElementById('admin-pin').value = '';
+      showTab('admin');
+      if (window.subscribeAdmin) window.subscribeAdmin();
     }
 
-    function logoutAdmin() {
+    async function logoutAdmin() {
+      try { await cloud.logout(); } catch (err) { console.error(err); }
       showTab('booking');
     }
 
@@ -1773,7 +1778,7 @@
       const selectedNames = allMenus.filter(m => state.selectedMenuIds.includes(m.id)).map(m => m.name).join(' / ');
       const rid = newCode();
       const data = {
-        id: Math.floor(100000 + Math.random() * 900000), name, phone, email,
+        id: Math.floor(100000 + Math.random() * 900000), name, phone, email, ref: newCode(),
         date: state.selectedDate, time: state.selectedTime, menu: selectedNames,
         note: (document.getElementById('book-note').value || '').trim().slice(0, 300),
         dur, slots: keys, createdAt: Date.now()
@@ -2136,7 +2141,7 @@
         const keys = coveredTimes(t, dur).map(x => slotKey(date, x));
         const menus = [...w.querySelectorAll('.pb-menus input:checked')].map(c => c.value).join(' / ');
         const data = {
-          id: Math.floor(100000 + Math.random() * 900000), name, phone: w.querySelector('.pb-phone').value.trim(), email: '',
+          id: Math.floor(100000 + Math.random() * 900000), ref: newCode(), name, phone: w.querySelector('.pb-phone').value.trim(), email: '',
           date, time: t, menu: menus || 'お電話でのご予約', note: w.querySelector('.pb-note').value.trim().slice(0, 300),
           dur, slots: keys, source: '電話', createdAt: Date.now()
         };
@@ -2403,7 +2408,9 @@
   <script type="module">
     import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
     import { getFirestore, collection, doc, setDoc, getDoc, getDocs, query, where, onSnapshot, runTransaction, writeBatch } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+    import { getAuth, signInWithEmailAndPassword, signOut } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
 
+    const ADMIN_EMAIL = 'rhphairdesign@gmail.com';
     const app = initializeApp({
       apiKey: "AIzaSyAwWDL4S1uD6S2t5s_QzF2VHoaysc3Hja0",
       authDomain: "rhphairdesign-18b4d.firebaseapp.com",
@@ -2413,22 +2420,29 @@
       appId: "1:414782690151:web:8f6751de61ff9bcea215c2"
     });
     const db = getFirestore(app);
+    const auth = getAuth(app);
     const col = n => collection(db, n);
     const cloud = window.cloud;
     const adminKeys = ['rhp_kartes_nocoup'];
     cloud.save = (key, val) => setDoc(doc(col(adminKeys.includes(key) ? 'admin' : 'appdata'), key), { value: val, updatedAt: Date.now() });
 
+    cloud.login = pw => signInWithEmailAndPassword(auth, ADMIN_EMAIL, pw);
+    cloud.isAdmin = () => !!auth.currentUser && auth.currentUser.email === ADMIN_EMAIL;
+
     cloud.book = (rid, data, keys) => runTransaction(db, async tx => {
       for (const k of keys) { if ((await tx.get(doc(col('slots'), k))).exists()) throw new Error('taken'); }
       tx.set(doc(col('reservations'), rid), data);
-      keys.forEach(k => tx.set(doc(col('slots'), k), { rid, d: data.date, t: data.time }));
+      tx.set(doc(col('refs'), data.ref), { rid });
+      keys.forEach(k => tx.set(doc(col('slots'), k), { ref: data.ref, kind: 'R', d: data.date, t: data.time }));
     });
     cloud.getByCode = async rid => { const s = await getDoc(doc(col('reservations'), rid)); return s.exists() ? s.data() : null; };
     cloud.cancel = async rid => {
       const s = await getDoc(doc(col('reservations'), rid));
       if (!s.exists()) return false;
+      const d = s.data();
       const b = writeBatch(db);
-      (s.data().slots || []).forEach(k => b.delete(doc(col('slots'), k)));
+      (d.slots || []).forEach(k => b.delete(doc(col('slots'), k)));
+      if (d.ref) b.delete(doc(col('refs'), d.ref));
       b.delete(doc(col('reservations'), rid));
       await b.commit();
       return true;
@@ -2437,35 +2451,48 @@
     cloud.block = (keys, date, memo) => runTransaction(db, async tx => {
       const grp = Math.random().toString(36).slice(2, 10);
       for (const k of keys) { if ((await tx.get(doc(col('slots'), k))).exists()) throw new Error('taken'); }
-      keys.forEach(k => tx.set(doc(col('slots'), k), { rid: 'BLOCK', d: date, t: k.split('_')[1], memo, grp }));
+      keys.forEach(k => tx.set(doc(col('slots'), k), { kind: 'BLOCK', d: date, t: k.split('_')[1], memo, grp }));
     });
     cloud.unblock = async key => {
       const ref = doc(col('slots'), key);
       const s = await getDoc(ref);
-      if (!s.exists() || s.data().rid !== 'BLOCK') return;
-      const grp = s.data().grp;
+      if (!s.exists()) return;
+      const x = s.data();
+      if (x.kind !== 'BLOCK' && x.rid !== 'BLOCK') return;
       const b = writeBatch(db);
-      if (grp) { (await getDocs(query(col('slots'), where('grp', '==', grp)))).forEach(d => b.delete(d.ref)); } else { b.delete(ref); }
+      if (x.grp) { (await getDocs(query(col('slots'), where('grp', '==', x.grp)))).forEach(d => b.delete(d.ref)); } else { b.delete(ref); }
       await b.commit();
     };
 
-    let adminOn = false;
+    let unsubs = [];
     window.subscribeAdmin = function () {
-      if (adminOn) return; adminOn = true;
-      onSnapshot(col('reservations'), snap => {
+      if (unsubs.length || !cloud.isAdmin()) return;
+      unsubs.push(onSnapshot(col('reservations'), snap => {
         const a = []; snap.forEach(d => a.push({ ...d.data(), rid: d.id }));
         a.sort((x, y) => (y.createdAt || 0) - (x.createdAt || 0));
         cloud.setReservations(a);
-      }, err => { console.error(err); notify('予約データを読み込めません。\n（' + errText(err) + '）'); });
-      onSnapshot(col('admin'), snap => {
+      }, err => { console.error(err); notify('予約データを読み込めません。\n（' + errText(err) + '）'); }));
+      unsubs.push(onSnapshot(col('admin'), snap => {
         snap.forEach(d => { cloud.cache[d.id] = d.data().value; });
         window.refreshApp();
-      }, err => console.error(err));
+      }, err => console.error(err)));
+    };
+    cloud.logout = async () => {
+      unsubs.forEach(u => u()); unsubs = [];
+      await signOut(auth);
+      cloud.setReservations([]);
+      delete cloud.cache['rhp_kartes_nocoup'];
+      window.refreshApp();
     };
 
     onSnapshot(col('slots'), snap => {
       const m = {}, b = {};
-      snap.forEach(d => { const x = d.data(); m[d.id] = x.rid || 1; if (x.rid === 'BLOCK') b[d.id] = x.memo || ''; });
+      snap.forEach(d => {
+        const x = d.data();
+        const isBlock = x.kind === 'BLOCK' || x.rid === 'BLOCK';
+        m[d.id] = isBlock ? 'BLOCK' : (x.ref || x.rid || 1);
+        if (isBlock) b[d.id] = x.memo || '';
+      });
       cloud.setSlots(m, b);
     }, err => console.error(err));
 
