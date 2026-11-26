@@ -850,7 +850,7 @@
         <!-- 予約の受付ルール -->
         <div class="bg-white rounded-3xl p-5 shadow-sm border">
           <h3 class="font-bold text-gray-800 mb-3 flex items-center gap-2">
-            <i class="fa-solid fa-sliders text-amber-600"></i> 予約の受付ルール <span class="text-[10px] font-normal text-gray-400">（版 11/26-i）</span>
+            <i class="fa-solid fa-sliders text-amber-600"></i> 予約の受付ルール <span class="text-[10px] font-normal text-gray-400">（版 11/26-k）</span>
           </h3>
           <form onsubmit="saveBookingSettings(event)" class="space-y-3 text-xs">
             <div>
@@ -858,9 +858,9 @@
               <input type="text" id="set-times" class="w-full p-2.5 border rounded-xl bg-gray-50" placeholder="09:30, 11:00, 13:00, 15:00, 17:00, 19:00">
             </div>
             <div class="grid grid-cols-3 gap-2">
-              <div><label class="block font-bold text-gray-700 mb-1">何日後から</label><input type="number" id="set-min" min="0" max="60" class="w-full p-2.5 border rounded-xl bg-gray-50"></div>
-              <div><label class="block font-bold text-gray-700 mb-1">何日先まで</label><input type="number" id="set-max" min="1" max="400" class="w-full p-2.5 border rounded-xl bg-gray-50"></div>
-              <div><label class="block font-bold text-gray-700 mb-1">変更・取消は何日前まで</label><input type="number" id="set-cancel" min="0" max="30" class="w-full p-2.5 border rounded-xl bg-gray-50"></div>
+              <div class="flex flex-col justify-end"><label class="block font-bold text-gray-700 mb-1" style="min-height:2.6em">何日後から</label><input type="number" id="set-min" min="0" max="60" class="w-full p-2.5 border rounded-xl bg-gray-50"></div>
+              <div class="flex flex-col justify-end"><label class="block font-bold text-gray-700 mb-1" style="min-height:2.6em">何日先まで</label><input type="number" id="set-max" min="1" max="400" class="w-full p-2.5 border rounded-xl bg-gray-50"></div>
+              <div class="flex flex-col justify-end"><label class="block font-bold text-gray-700 mb-1" style="min-height:2.6em">取消は何日前まで</label><input type="number" id="set-cancel" min="0" max="30" class="w-full p-2.5 border rounded-xl bg-gray-50"></div>
             </div>
             <p class="text-gray-500">例：「何日先まで」を120にすると約4か月先まで受付します。0日後＝当日の予約も可、1日後＝明日から。</p>
             <button type="submit" class="w-full py-2.5 bg-amber-500 hover:bg-amber-600 text-slate-900 font-bold rounded-xl shadow cursor-pointer">受付ルールを保存</button>
@@ -1419,6 +1419,7 @@
     }
     const cloud = window.cloud = {
       cache: {}, save: null,
+      setBlockMemos(m) { state.blockMemos = m; renderAdminCalendar(); },
       setSlots(m, b) { state.slots = m; state.blocks = b || {}; renderAdminCalendar(); },
       setReservations(a) { state.reservations = a; renderReservations(); updateDashboard(); },
       get(key) { return key in this.cache ? this.cache[key] : null; },
@@ -1470,6 +1471,7 @@
       slots: {},
       dayHours: {},
       blocks: {},
+      blockMemos: {},
       booking: { ...DEFAULT_BOOKING },
       activeCategory: "すべて",
       selectedMenuIds: [],
@@ -2079,7 +2081,7 @@
         const rs = dayRes.filter(r => r.time === t);
         if (rs.length) return rs.map(r => row(t, `<div class="min-w-0 flex-1 break-words"><div class="font-bold">${esc(r.name)} 様 <span class="font-normal text-gray-500">(${esc(r.phone || '電話番号なし')})</span>${r.source ? ` <span class="text-[10px] font-normal px-1.5 py-0.5 rounded bg-slate-200">${esc(r.source)}</span>` : ''}</div><div class="text-gray-600">${esc(r.menu)}${r.dur ? `（${r.dur}分）` : ''}</div>${r.note ? `<div class="text-amber-700">📝 ${esc(r.note)}</div>` : ''}</div>` + btn('bg-red-100 text-red-600', `deleteReservation(${r.id})`, '削除'), 'bg-amber-50 border-amber-200')).join('');
         const k = slotKey(calSelected, t), v = state.slots[k];
-        if (v === 'BLOCK') return row(t, `<div class="flex-1 min-w-0 break-words pt-1 text-slate-700">🚫 消し込み済み ${esc(state.blocks[k] || '')}</div>` + btn('bg-gray-200 text-gray-700', `unblockSlot('${calSelected}','${t}')`, '解除'), 'bg-slate-100 border-slate-300');
+        if (v === 'BLOCK') return row(t, `<div class="flex-1 min-w-0 break-words pt-1 text-slate-700">🚫 消し込み済み ${esc(state.blockMemos[k] || state.blocks[k] || '')}</div>` + btn('bg-gray-200 text-gray-700', `unblockSlot('${calSelected}','${t}')`, '解除'), 'bg-slate-100 border-slate-300');
         if (v) return row(t, '<div class="flex-1 pt-1 text-gray-400">↑ ご予約の施術中</div>', 'bg-gray-50 text-gray-400');
         return row(t, '<div class="flex-1 pt-1 text-gray-400">空き</div><div class="flex gap-1.5 shrink-0">' + btn('bg-amber-500 text-slate-900', `addPhoneBooking('${calSelected}','${t}')`, '予約を入れる') + btn('bg-slate-800 text-white', `blockSlot('${calSelected}','${t}')`, '消し込み') + '</div>', 'bg-white text-gray-500');
       }).join('') + '</div></div>';
@@ -2451,7 +2453,10 @@
     cloud.block = (keys, date, memo) => runTransaction(db, async tx => {
       const grp = Math.random().toString(36).slice(2, 10);
       for (const k of keys) { if ((await tx.get(doc(col('slots'), k))).exists()) throw new Error('taken'); }
-      keys.forEach(k => tx.set(doc(col('slots'), k), { kind: 'BLOCK', d: date, t: k.split('_')[1], memo, grp }));
+      keys.forEach(k => {
+        tx.set(doc(col('slots'), k), { kind: 'BLOCK', d: date, t: k.split('_')[1], grp });
+        if (memo) tx.set(doc(col('bmemo'), k), { memo });
+      });
     });
     cloud.unblock = async key => {
       const ref = doc(col('slots'), key);
@@ -2460,7 +2465,7 @@
       const x = s.data();
       if (x.kind !== 'BLOCK' && x.rid !== 'BLOCK') return;
       const b = writeBatch(db);
-      if (x.grp) { (await getDocs(query(col('slots'), where('grp', '==', x.grp)))).forEach(d => b.delete(d.ref)); } else { b.delete(ref); }
+      if (x.grp) { (await getDocs(query(col('slots'), where('grp', '==', x.grp)))).forEach(d => { b.delete(d.ref); b.delete(doc(col('bmemo'), d.id)); }); } else { b.delete(ref); b.delete(doc(col('bmemo'), key)); }
       await b.commit();
     };
 
@@ -2472,6 +2477,10 @@
         a.sort((x, y) => (y.createdAt || 0) - (x.createdAt || 0));
         cloud.setReservations(a);
       }, err => { console.error(err); notify('予約データを読み込めません。\n（' + errText(err) + '）'); }));
+      unsubs.push(onSnapshot(col('bmemo'), snap => {
+        const m = {}; snap.forEach(d => { m[d.id] = d.data().memo || ''; });
+        cloud.setBlockMemos(m);
+      }, err => console.error(err)));
       unsubs.push(onSnapshot(col('admin'), snap => {
         snap.forEach(d => { cloud.cache[d.id] = d.data().value; });
         window.refreshApp();
@@ -2481,6 +2490,7 @@
       unsubs.forEach(u => u()); unsubs = [];
       await signOut(auth);
       cloud.setReservations([]);
+      cloud.setBlockMemos({});
       delete cloud.cache['rhp_kartes_nocoup'];
       window.refreshApp();
     };
