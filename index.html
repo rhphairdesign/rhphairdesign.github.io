@@ -812,6 +812,44 @@
           <div id="karte-list" class="space-y-2 max-h-48 overflow-y-auto"><p class="text-xs text-gray-400">登録されたカルテはありません。</p></div>
         </div>
 
+        <!-- 会計・来店記録 -->
+        <div class="bg-white rounded-3xl p-5 shadow-sm border">
+          <h3 class="font-bold text-gray-800 mb-3 flex items-center gap-2"><i class="fa-solid fa-receipt text-amber-600"></i> 会計・来店記録</h3>
+          <div class="space-y-3 text-xs">
+            <div class="grid grid-cols-2 gap-3">
+              <input type="date" id="ac-date" class="w-full p-2.5 border rounded-xl bg-gray-50">
+              <input type="text" id="ac-name" placeholder="お名前" class="w-full p-2.5 border rounded-xl bg-gray-50">
+            </div>
+            <input type="tel" id="ac-phone" placeholder="お電話番号" class="w-full p-2.5 border rounded-xl bg-gray-50">
+            <div class="grid grid-cols-2 gap-3">
+              <input type="text" id="ac-menu" placeholder="メニュー名" class="w-full p-2.5 border rounded-xl bg-gray-50">
+              <input type="number" id="ac-price" placeholder="金額" class="w-full p-2.5 border rounded-xl bg-gray-50">
+            </div>
+            <button type="button" onclick="addCartMenu()" class="w-full py-2.5 bg-amber-500 hover:bg-amber-600 text-slate-900 font-bold rounded-xl shadow transition cursor-pointer">＋ メニューを追加</button>
+            <div class="grid grid-cols-2 gap-3">
+              <select id="ac-prod" class="w-full p-2.5 border rounded-xl bg-gray-50"></select>
+              <input type="number" id="ac-qty" value="1" min="1" class="w-full p-2.5 border rounded-xl bg-gray-50">
+            </div>
+            <button type="button" onclick="addCartProduct()" class="w-full py-2.5 bg-amber-500 hover:bg-amber-600 text-slate-900 font-bold rounded-xl shadow transition cursor-pointer">＋ 商品を追加</button>
+            <div id="ac-cart" class="space-y-2"></div>
+            <button type="button" onclick="saveVisit()" class="w-full py-2.5 bg-amber-500 hover:bg-amber-600 text-slate-900 font-bold rounded-xl shadow transition cursor-pointer">来店済みで保存</button>
+          </div>
+        </div>
+        <div class="bg-white rounded-3xl p-5 shadow-sm border">
+          <h3 class="font-bold text-gray-800 mb-3 flex items-center gap-2"><i class="fa-solid fa-bag-shopping text-amber-600"></i> 商品一覧（管理側のみ）</h3>
+          <div class="grid grid-cols-2 gap-3 text-xs mb-3">
+            <input type="text" id="pr-name" placeholder="商品名" class="w-full p-2.5 border rounded-xl bg-gray-50">
+            <input type="number" id="pr-price" placeholder="価格" class="w-full p-2.5 border rounded-xl bg-gray-50">
+          </div>
+          <button type="button" onclick="addProduct()" class="w-full py-2.5 bg-amber-500 hover:bg-amber-600 text-slate-900 font-bold rounded-xl shadow transition cursor-pointer mb-3">＋ 商品を登録</button>
+          <div id="pr-list" class="space-y-2 max-h-48 overflow-y-auto"></div>
+        </div>
+        <div class="bg-white rounded-3xl p-5 shadow-sm border">
+          <h3 class="font-bold text-gray-800 mb-3 flex items-center gap-2"><i class="fa-solid fa-clock-rotate-left text-amber-600"></i> 来店履歴</h3>
+          <input type="text" id="vs-search" oninput="renderVisits()" placeholder="お名前で検索" class="w-full p-2.5 border rounded-xl bg-gray-50 text-xs mb-3">
+          <div id="vs-list" class="space-y-3 max-h-80 overflow-y-auto"></div>
+        </div>
+
         <!-- 店舗からのお知らせ設定 -->
         <div class="bg-white rounded-3xl p-5 shadow-sm border">
           <h3 class="font-bold text-gray-800 mb-3 flex items-center gap-2">
@@ -850,7 +888,7 @@
         <!-- 予約の受付ルール -->
         <div class="bg-white rounded-3xl p-5 shadow-sm border">
           <h3 class="font-bold text-gray-800 mb-3 flex items-center gap-2">
-            <i class="fa-solid fa-sliders text-amber-600"></i> 予約の受付ルール <span class="text-[10px] font-normal text-gray-400">（版 11/26-k）</span>
+            <i class="fa-solid fa-sliders text-amber-600"></i> 予約の受付ルール <span class="text-[10px] font-normal text-gray-400">（版 11/28-a）</span>
           </h3>
           <form onsubmit="saveBookingSettings(event)" class="space-y-3 text-xs">
             <div>
@@ -2392,6 +2430,63 @@
       a.click();
     }
 
+
+    // ---- 会計・来店記録（管理者専用データ） ----
+    state.products = []; state.visits = []; let cart = [];
+    const yen = n => Number(n || 0).toLocaleString() + '円';
+    function loadAcct() {
+      const g = k => { try { const v = cloud.get(k); return v ? JSON.parse(v) : []; } catch (e) { return []; } };
+      state.products = g('rhp_products_nocoup'); state.visits = g('rhp_visits_nocoup');
+    }
+    function renderAcct() {
+      const sel = document.getElementById('ac-prod'); if (!sel) return;
+      const d = document.getElementById('ac-date'); if (d && !d.value) d.value = ymd(new Date());
+      sel.innerHTML = '<option value="">商品を選ぶ</option>' + state.products.map(p => `<option value="${p.id}">${esc(p.name)}（${yen(p.price)}）</option>`).join('');
+      document.getElementById('pr-list').innerHTML = state.products.map(p => `<div class="flex justify-between items-center text-xs p-2 border rounded-xl bg-gray-50"><span>${esc(p.name)} ${yen(p.price)}</span><button type="button" onclick="delProduct(${p.id})" class="text-red-500 cursor-pointer">削除</button></div>`).join('') || '<p class="text-xs text-gray-400">商品は未登録です。</p>';
+      renderCart(); renderVisits();
+    }
+    function addProduct() {
+      const n = document.getElementById('pr-name').value.trim(), p = Number(document.getElementById('pr-price').value);
+      if (!n || !(p >= 0) || document.getElementById('pr-price').value === '') { notify('商品名と価格を入れてください。'); return; }
+      state.products.push({ id: Date.now(), name: n, price: p });
+      cloud.set('rhp_products_nocoup', JSON.stringify(state.products));
+      document.getElementById('pr-name').value = ''; document.getElementById('pr-price').value = ''; renderAcct();
+    }
+    function delProduct(id) { state.products = state.products.filter(p => p.id !== id); cloud.set('rhp_products_nocoup', JSON.stringify(state.products)); renderAcct(); }
+    function addCartMenu() {
+      const n = document.getElementById('ac-menu').value.trim(), v = document.getElementById('ac-price').value;
+      if (!n || v === '') { notify('メニュー名と金額を入れてください。'); return; }
+      cart.push({ n, p: Number(v), q: 1 });
+      document.getElementById('ac-menu').value = ''; document.getElementById('ac-price').value = ''; renderCart();
+    }
+    function addCartProduct() {
+      const p = state.products.find(x => String(x.id) === document.getElementById('ac-prod').value);
+      if (!p) { notify('商品を選んでください。'); return; }
+      cart.push({ n: p.name, p: p.price, q: Math.max(1, Number(document.getElementById('ac-qty').value) || 1) }); renderCart();
+    }
+    function cartTotal(a) { return a.reduce((t, x) => t + x.p * x.q, 0); }
+    function renderCart() {
+      const el = document.getElementById('ac-cart'); if (!el) return;
+      el.innerHTML = cart.map((x, i) => `<div class="flex justify-between items-center text-xs p-2 border rounded-xl bg-gray-50"><span>${esc(x.n)} ${yen(x.p)} × ${x.q}</span><button type="button" onclick="cart.splice(${i},1);renderCart()" class="text-red-500 cursor-pointer">削除</button></div>`).join('') + (cart.length ? `<div class="text-right font-bold text-gray-800">合計 ${yen(cartTotal(cart))}</div>` : '');
+    }
+    function saveVisit() {
+      const name = document.getElementById('ac-name').value.trim(), date = document.getElementById('ac-date').value;
+      if (!name || !date || !cart.length) { notify('日付・お名前・メニューか商品を入れてください。'); return; }
+      state.visits.push({ id: Date.now(), date, name, phone: document.getElementById('ac-phone').value.trim(), items: cart, total: cartTotal(cart) });
+      cloud.set('rhp_visits_nocoup', JSON.stringify(state.visits));
+      cart = []; renderAcct(); showToast('保存完了', name + '様の来店を記録しました！');
+    }
+    async function delVisit(id) {
+      if (!(await askDialog({ title: 'この来店記録を削除しますか？', ok: '削除する' }))) return;
+      state.visits = state.visits.filter(v => v.id !== id); cloud.set('rhp_visits_nocoup', JSON.stringify(state.visits)); renderVisits();
+    }
+    function renderVisits() {
+      const el = document.getElementById('vs-list'); if (!el) return;
+      const q = (document.getElementById('vs-search').value || '').trim(), g = {};
+      state.visits.forEach(v => { if (!q || v.name.includes(q)) (g[v.name + '|' + (v.phone || '')] = g[v.name + '|' + (v.phone || '')] || []).push(v); });
+      const rows = Object.values(g).map(a => a.sort((x, y) => y.date.localeCompare(x.date))).sort((x, y) => y[0].date.localeCompare(x[0].date));
+      el.innerHTML = rows.map(a => `<div class="p-3 border rounded-xl bg-gray-50 text-xs"><div class="font-bold text-gray-800">${esc(a[0].name)} 様 <span class="font-normal text-gray-500">${esc(a[0].phone || '')}</span></div><div class="text-amber-700 font-bold">来店${a.length}回 ／ 累計 ${yen(a.reduce((t, v) => t + v.total, 0))}</div>` + a.map(v => `<div class="flex justify-between items-center mt-1 text-gray-600"><span>${esc(v.date)} ${yen(v.total)}<br>${v.items.map(x => esc(x.n) + (x.q > 1 ? '×' + x.q : '')).join('、')}</span><button type="button" onclick="delVisit(${v.id})" class="text-red-500 cursor-pointer">削除</button></div>`).join('') + '</div>').join('') || '<p class="text-xs text-gray-400">来店記録はありません。</p>';
+    }
     function syncStateFromCloud() {
       const g = (k, d) => { try { const v = cloud.get(k); return v ? JSON.parse(v) : d; } catch (e) { return d; } };
       state.customHolidays = g('rhp_custom_holidays_nocoup', []);
@@ -2401,6 +2496,7 @@
       state.booking = { ...DEFAULT_BOOKING, ...g('rhp_booking_settings_nocoup', {}) };
       timeSlots = state.booking.timeSlots;
       state.dayHours = g('rhp_day_hours_nocoup', {});
+      loadAcct(); renderAcct();
     }
     window.startApp = function () { syncStateFromCloud(); initSystem(); window.__started = true; };
     window.refreshApp = function () { syncStateFromCloud(); initSystem(); };
@@ -2425,7 +2521,7 @@
     const auth = getAuth(app);
     const col = n => collection(db, n);
     const cloud = window.cloud;
-    const adminKeys = ['rhp_kartes_nocoup'];
+    const adminKeys = ['rhp_kartes_nocoup', 'rhp_products_nocoup', 'rhp_visits_nocoup'];
     cloud.save = (key, val) => setDoc(doc(col(adminKeys.includes(key) ? 'admin' : 'appdata'), key), { value: val, updatedAt: Date.now() });
 
     cloud.login = pw => signInWithEmailAndPassword(auth, ADMIN_EMAIL, pw);
@@ -2492,6 +2588,7 @@
       cloud.setReservations([]);
       cloud.setBlockMemos({});
       delete cloud.cache['rhp_kartes_nocoup'];
+      delete cloud.cache['rhp_products_nocoup']; delete cloud.cache['rhp_visits_nocoup'];
       window.refreshApp();
     };
 
