@@ -812,37 +812,29 @@
           <div id="karte-list" class="space-y-2 max-h-48 overflow-y-auto"><p class="text-xs text-gray-400">登録されたカルテはありません。</p></div>
         </div>
 
-        <!-- 会計・来店記録 -->
+        <!-- 会計 -->
         <div class="bg-white rounded-3xl p-5 shadow-sm border">
-          <h3 class="font-bold text-gray-800 mb-3 flex items-center gap-2"><i class="fa-solid fa-receipt text-amber-600"></i> 会計・来店記録</h3>
-          <div class="space-y-3 text-xs">
-            <div class="grid grid-cols-2 gap-3">
-              <input type="date" id="ac-date" class="w-full p-2.5 border rounded-xl bg-gray-50">
-              <input type="text" id="ac-name" placeholder="お名前" class="w-full p-2.5 border rounded-xl bg-gray-50">
-            </div>
-            <input type="tel" id="ac-phone" placeholder="お電話番号" class="w-full p-2.5 border rounded-xl bg-gray-50">
-            <div class="grid grid-cols-2 gap-3">
-              <input type="text" id="ac-menu" placeholder="メニュー名" class="w-full p-2.5 border rounded-xl bg-gray-50">
-              <input type="number" id="ac-price" placeholder="金額" class="w-full p-2.5 border rounded-xl bg-gray-50">
-            </div>
-            <button type="button" onclick="addCartMenu()" class="w-full py-2.5 bg-amber-500 hover:bg-amber-600 text-slate-900 font-bold rounded-xl shadow transition cursor-pointer">＋ メニューを追加</button>
-            <div class="grid grid-cols-2 gap-3">
-              <select id="ac-prod" class="w-full p-2.5 border rounded-xl bg-gray-50"></select>
-              <input type="number" id="ac-qty" value="1" min="1" class="w-full p-2.5 border rounded-xl bg-gray-50">
-            </div>
-            <button type="button" onclick="addCartProduct()" class="w-full py-2.5 bg-amber-500 hover:bg-amber-600 text-slate-900 font-bold rounded-xl shadow transition cursor-pointer">＋ 商品を追加</button>
-            <div id="ac-cart" class="space-y-2"></div>
-            <button type="button" onclick="saveVisit()" class="w-full py-2.5 bg-amber-500 hover:bg-amber-600 text-slate-900 font-bold rounded-xl shadow transition cursor-pointer">来店済みで保存</button>
-          </div>
+          <h3 class="font-bold text-gray-800 mb-2 flex items-center gap-2"><i class="fa-solid fa-receipt text-amber-600"></i> 会計</h3>
+          <p class="text-xs text-gray-500 mb-3">予約カレンダーでお客様のお名前をタップすると、そのお客様の会計が開きます。予約のないお客様はこちらから。</p>
+          <button type="button" onclick="openCheckout(null)" class="w-full py-2.5 bg-amber-500 hover:bg-amber-600 text-slate-900 font-bold rounded-xl shadow transition cursor-pointer">予約なしで会計を開く</button>
         </div>
         <div class="bg-white rounded-3xl p-5 shadow-sm border">
           <h3 class="font-bold text-gray-800 mb-3 flex items-center gap-2"><i class="fa-solid fa-bag-shopping text-amber-600"></i> 商品一覧（管理側のみ）</h3>
-          <div class="grid grid-cols-2 gap-3 text-xs mb-3">
-            <input type="text" id="pr-name" placeholder="商品名" class="w-full p-2.5 border rounded-xl bg-gray-50">
-            <input type="number" id="pr-price" placeholder="価格" class="w-full p-2.5 border rounded-xl bg-gray-50">
+          <div class="space-y-2 text-xs mb-3">
+            <select id="pr-genre" class="w-full p-2.5 border rounded-xl bg-gray-50"></select>
+            <div class="grid grid-cols-2 gap-3">
+              <input type="text" id="pr-name" placeholder="商品名" class="w-full p-2.5 border rounded-xl bg-gray-50">
+              <input type="number" id="pr-price" placeholder="価格" class="w-full p-2.5 border rounded-xl bg-gray-50">
+            </div>
           </div>
-          <button type="button" onclick="addProduct()" class="w-full py-2.5 bg-amber-500 hover:bg-amber-600 text-slate-900 font-bold rounded-xl shadow transition cursor-pointer mb-3">＋ 商品を登録</button>
-          <div id="pr-list" class="space-y-2 max-h-48 overflow-y-auto"></div>
+          <button type="button" onclick="addProduct()" class="w-full py-2.5 bg-amber-500 hover:bg-amber-600 text-slate-900 font-bold rounded-xl shadow transition cursor-pointer mb-4">＋ 商品を登録</button>
+          <div class="text-xs font-bold text-gray-600 mb-2">商品のジャンル（追加・削除できます）</div>
+          <div id="pg-admin" class="flex flex-wrap gap-1.5 mb-2 text-xs"></div>
+          <div class="flex gap-2 mb-4 text-xs">
+            <input type="text" id="pg-new" maxlength="20" placeholder="新しいジャンル名" class="flex-1 p-2.5 border rounded-xl bg-gray-50">
+            <button type="button" onclick="addProdGenre()" class="px-3 py-2 bg-amber-500 hover:bg-amber-600 text-slate-900 font-bold rounded-xl cursor-pointer">＋ 追加</button>
+          </div>
+          <div id="pr-list" class="space-y-3 max-h-96 overflow-y-auto"></div>
         </div>
         <div class="bg-white rounded-3xl p-5 shadow-sm border">
           <h3 class="font-bold text-gray-800 mb-3 flex items-center gap-2"><i class="fa-solid fa-clock-rotate-left text-amber-600"></i> 来店履歴</h3>
@@ -888,7 +880,7 @@
         <!-- 予約の受付ルール -->
         <div class="bg-white rounded-3xl p-5 shadow-sm border">
           <h3 class="font-bold text-gray-800 mb-3 flex items-center gap-2">
-            <i class="fa-solid fa-sliders text-amber-600"></i> 予約の受付ルール <span class="text-[10px] font-normal text-gray-400">（版 11/28-b）</span>
+            <i class="fa-solid fa-sliders text-amber-600"></i> 予約の受付ルール <span class="text-[10px] font-normal text-gray-400">（版 11/28-c）</span>
           </h3>
           <form onsubmit="saveBookingSettings(event)" class="space-y-3 text-xs">
             <div>
@@ -932,6 +924,14 @@
             </button>
           </div>
           
+          <div class="border-b pb-4 mb-4 text-xs">
+            <div class="font-bold text-gray-600 mb-2">メニューのジャンル（追加・削除できます）</div>
+            <div id="menu-genre-admin" class="flex flex-wrap gap-1.5 mb-2"></div>
+            <div class="flex gap-2">
+              <input type="text" id="mg-new" maxlength="20" placeholder="新しいジャンル名" class="flex-1 p-2.5 border rounded-xl bg-gray-50">
+              <button type="button" onclick="addMenuGenre()" class="px-3 py-2 bg-amber-500 hover:bg-amber-600 text-slate-900 font-bold rounded-xl cursor-pointer">＋ 追加</button>
+            </div>
+          </div>
           <form onsubmit="saveAdminMenu(event)" class="space-y-3 text-xs border-b pb-4 mb-4">
             <input type="hidden" id="edit-menu-id" value="">
             <div class="grid grid-cols-2 gap-2">
@@ -1499,7 +1499,9 @@
       { id: 30, category: "スパ・その他", name: "シャンプーブロー", price: 3900, time: 40, desc: "シャンプー＆ブロー" }
     ];
 
-    const categories = ["すべて", "カット", "カラー", "パーマ", "縮毛矯正", "トリートメント", "スパ・その他"];
+    const DEFAULT_MENU_GENRES = ["カット", "カラー", "パーマ", "縮毛矯正", "トリートメント", "スパ・その他"];
+    let menuGenres = [...DEFAULT_MENU_GENRES];
+    let categories = ["すべて", ...menuGenres];
     const DEFAULT_BOOKING = { timeSlots: Array.from({ length: 20 }, (_, i) => { const m = 570 + i * 30; return String(Math.floor(m / 60)).padStart(2, '0') + ':' + String(m % 60).padStart(2, '0'); }), minDays: 1, maxDays: 120, cancelDays: 1 };
     let timeSlots = [...DEFAULT_BOOKING.timeSlots];
 
@@ -1577,6 +1579,7 @@
     function restoreDefaultMenus() {
       allMenus = [...initialMenus];
       cloud.set('rhp_custom_menus_nocoup', JSON.stringify(allMenus));
+      loadMenuGenres(); saveMenuGenres();
       renderMenuCategories();
       renderMenuList();
       renderAdminMenuList();
@@ -1591,6 +1594,7 @@
         allMenus = [...initialMenus];
       }
 
+      loadMenuGenres();
       applyHeroSettings();
       applyBookingSettings();
       renderNewsBanner();
@@ -1868,7 +1872,45 @@
       document.body.removeChild(textArea);
     }
 
+    // ---- メニューのジャンル（追加・削除できる） ----
+    const badName = s => /['"\\<>`]/.test(s);
+    function loadMenuGenres() {
+      let g = [...DEFAULT_MENU_GENRES];
+      try { const v = cloud.get('rhp_menu_genres_nocoup'); if (v) { const a = JSON.parse(v); if (Array.isArray(a) && a.length) g = a; } } catch (e) { }
+      allMenus.forEach(m => { if (m.category && !g.includes(m.category)) g.push(m.category); });
+      menuGenres = g; categories = ['すべて', ...g];
+      if (state.activeCategory !== 'すべて' && !g.includes(state.activeCategory)) state.activeCategory = 'すべて';
+    }
+    function saveMenuGenres() {
+      cloud.set('rhp_menu_genres_nocoup', JSON.stringify(menuGenres));
+      categories = ['すべて', ...menuGenres];
+      if (state.activeCategory !== 'すべて' && !menuGenres.includes(state.activeCategory)) state.activeCategory = 'すべて';
+      renderMenuCategories(); renderMenuList(); renderAdminMenuList();
+    }
+    function addMenuGenre() {
+      const el = document.getElementById('mg-new'), n = el.value.trim();
+      if (!n) { notify('ジャンル名を入れてください。'); return; }
+      if (badName(n)) { notify('ジャンル名に使えない記号（引用符・バックスラッシュ・< >）が入っています。'); return; }
+      if (n === 'すべて' || menuGenres.includes(n)) { notify('同じ名前のジャンルがあります。'); return; }
+      menuGenres.push(n); el.value = ''; saveMenuGenres();
+    }
+    async function delMenuGenre(i) {
+      const g = menuGenres[i];
+      if (allMenus.some(m => m.category === g)) { notify('「' + g + '」にはメニューが入っています。先にメニューを別のジャンルへ移すか、削除してください。'); return; }
+      if (!(await askDialog({ title: '「' + g + '」を削除しますか？', ok: '削除する' }))) return;
+      menuGenres.splice(i, 1); saveMenuGenres();
+    }
+    function renderMenuGenreAdmin() {
+      const el = document.getElementById('menu-genre-admin'); if (!el) return;
+      el.innerHTML = menuGenres.map((g, i) => `<span class="inline-flex items-center gap-1 px-2.5 py-1 rounded-full bg-gray-100 text-gray-700 font-bold">${esc(g)}<button type="button" onclick="delMenuGenre(${i})" class="text-red-500 cursor-pointer">×</button></span>`).join('');
+      const sel = document.getElementById('menu-form-cat'); if (!sel) return;
+      const cur = sel.value;
+      sel.innerHTML = menuGenres.map(g => `<option value="${esc(g)}">${esc(g)}</option>`).join('');
+      if (menuGenres.includes(cur)) sel.value = cur;
+    }
+
     function renderAdminMenuList() {
+      renderMenuGenreAdmin();
       const container = document.getElementById('admin-menu-list');
       if (!container) return;
 
@@ -2117,7 +2159,7 @@
       const hoursNote = state.dayHours[calSelected] ? `<p class="text-[11px] text-slate-700 mb-1">この日の営業時間：${esc(state.dayHours[calSelected].from)}〜${esc(state.dayHours[calSelected].to)}（最後の開始時刻）</p>` : '';
       h += `<div class="mt-3 bg-white border rounded-2xl p-3 shadow-sm"><div class="font-bold text-sm mb-1">${calSelected} のご予約${closedNow ? '（休業日）' : ''}</div><div class="flex flex-wrap gap-1.5 mb-2">${dctl}</div>${hoursNote}<p class="text-[10px] text-gray-500 mb-2">ホットペッパー等で埋まった時間は「消し込み」を押すと、こちらの予約画面でも埋まります。</p><div class="space-y-1.5">` + times.map(t => {
         const rs = dayRes.filter(r => r.time === t);
-        if (rs.length) return rs.map(r => row(t, `<div class="min-w-0 flex-1 break-words"><div class="font-bold">${esc(r.name)} 様 <span class="font-normal text-gray-500">(${esc(r.phone || '電話番号なし')})</span>${r.source ? ` <span class="text-[10px] font-normal px-1.5 py-0.5 rounded bg-slate-200">${esc(r.source)}</span>` : ''}</div><div class="text-gray-600">${esc(r.menu)}${r.dur ? `（${r.dur}分）` : ''}</div>${r.note ? `<div class="text-amber-700">📝 ${esc(r.note)}</div>` : ''}</div>` + btn('bg-red-100 text-red-600', `deleteReservation(${r.id})`, '削除'), 'bg-amber-50 border-amber-200')).join('');
+        if (rs.length) return rs.map(r => row(t, `<div class="min-w-0 flex-1 break-words cursor-pointer" onclick="openCheckout(${r.id})"><div class="font-bold">${esc(r.name)} 様 ${visitFor(r.id) ? '<span class="text-[10px] font-normal px-1.5 py-0.5 rounded bg-emerald-600 text-white">会計済</span> ' : ''}<span class="font-normal text-gray-500">(${esc(r.phone || '電話番号なし')})</span>${r.source ? ` <span class="text-[10px] font-normal px-1.5 py-0.5 rounded bg-slate-200">${esc(r.source)}</span>` : ''}</div><div class="text-gray-600">${esc(r.menu)}${r.dur ? `（${r.dur}分）` : ''}</div>${r.note ? `<div class="text-amber-700">📝 ${esc(r.note)}</div>` : ''}</div>` + '<div class="flex flex-col gap-1.5 shrink-0">' + btn('bg-amber-500 text-slate-900', `openCheckout(${r.id})`, '会計') + btn('bg-red-100 text-red-600', `deleteReservation(${r.id})`, '削除') + '</div>', 'bg-amber-50 border-amber-200')).join('');
         const k = slotKey(calSelected, t), v = state.slots[k];
         if (v === 'BLOCK') return row(t, `<div class="flex-1 min-w-0 break-words pt-1 text-slate-700">🚫 消し込み済み ${esc(state.blockMemos[k] || state.blocks[k] || '')}</div>` + btn('bg-gray-200 text-gray-700', `unblockSlot('${calSelected}','${t}')`, '解除'), 'bg-slate-100 border-slate-300');
         if (v) return row(t, '<div class="flex-1 pt-1 text-gray-400">↑ ご予約の施術中</div>', 'bg-gray-50 text-gray-400');
@@ -2432,53 +2474,132 @@
 
 
     // ---- 会計・来店記録（管理者専用データ） ----
-    state.products = []; state.visits = []; let cart = [];
+    const DEFAULT_PROD_GENRES = ['シャンプー', 'コンディショナー', 'ヘアパック・トリートメント', 'アウトバストリートメント', '頭皮ケア', 'プレスタイリング・寝ぐせ直し', 'ヘアスプレー・ヘアミスト', 'ヘアワックス・クリーム', 'ヘアジェル', 'ヘアムース', 'その他スタイリング', '飲食料品', 'その他'];
+    state.products = []; state.visits = []; state.prodGenres = [...DEFAULT_PROD_GENRES];
     const yen = n => Number(n || 0).toLocaleString() + '円';
+    const visitFor = id => state.visits.find(v => v.resId === id);
     function loadAcct() {
-      const g = k => { try { const v = cloud.get(k); return v ? JSON.parse(v) : []; } catch (e) { return []; } };
-      state.products = g('rhp_products_nocoup'); state.visits = g('rhp_visits_nocoup');
+      const g = (k, d) => { try { const v = cloud.get(k); return v ? JSON.parse(v) : d; } catch (e) { return d; } };
+      state.products = g('rhp_products_nocoup', []); state.visits = g('rhp_visits_nocoup', []);
+      state.prodGenres = g('rhp_prodgenres_nocoup', [...DEFAULT_PROD_GENRES]);
+      if (!Array.isArray(state.prodGenres) || !state.prodGenres.length) state.prodGenres = [...DEFAULT_PROD_GENRES];
+      if (!state.prodGenres.includes('その他')) state.prodGenres.push('その他');
+      state.products.forEach(p => { if (!state.prodGenres.includes(p.genre)) p.genre = 'その他'; });
     }
+    const saveProducts = () => cloud.set('rhp_products_nocoup', JSON.stringify(state.products));
+    const saveProdGenres = () => cloud.set('rhp_prodgenres_nocoup', JSON.stringify(state.prodGenres));
     function renderAcct() {
-      const sel = document.getElementById('ac-prod'); if (!sel) return;
-      const d = document.getElementById('ac-date'); if (d && !d.value) d.value = ymd(new Date());
-      sel.innerHTML = '<option value="">商品を選ぶ</option>' + state.products.map(p => `<option value="${p.id}">${esc(p.name)}（${yen(p.price)}）</option>`).join('');
-      document.getElementById('pr-list').innerHTML = state.products.map(p => `<div class="flex justify-between items-center text-xs p-2 border rounded-xl bg-gray-50"><span>${esc(p.name)} ${yen(p.price)}</span><button type="button" onclick="delProduct(${p.id})" class="text-red-500 cursor-pointer">削除</button></div>`).join('') || '<p class="text-xs text-gray-400">商品は未登録です。</p>';
-      renderCart(); renderVisits();
+      const sel = document.getElementById('pr-genre'); if (!sel) return;
+      const cur = sel.value;
+      sel.innerHTML = state.prodGenres.map(g => `<option value="${esc(g)}">${esc(g)}</option>`).join('');
+      if (state.prodGenres.includes(cur)) sel.value = cur;
+      document.getElementById('pg-admin').innerHTML = state.prodGenres.map((g, i) => `<span class="inline-flex items-center gap-1 px-2.5 py-1 rounded-full bg-gray-100 text-gray-700 font-bold">${esc(g)}${g === 'その他' ? '' : `<button type="button" onclick="delProdGenre(${i})" class="text-red-500 cursor-pointer">×</button>`}</span>`).join('');
+      const groups = state.prodGenres.map(g => ({ g, items: state.products.filter(p => p.genre === g) })).filter(x => x.items.length);
+      document.getElementById('pr-list').innerHTML = groups.map(x => `<div><div class="text-[11px] font-bold text-amber-700 mb-1">${esc(x.g)}（${x.items.length}）</div><div class="space-y-1.5">` + x.items.map(p => `<div class="flex justify-between items-center gap-2 text-xs p-2 border rounded-xl bg-gray-50"><span class="min-w-0 break-words">${esc(p.name)} ${yen(p.price)}</span><button type="button" onclick="delProduct(${p.id})" class="shrink-0 text-red-500 cursor-pointer">削除</button></div>`).join('') + '</div></div>').join('') || '<p class="text-xs text-gray-400">商品は未登録です。</p>';
+      renderVisits();
     }
     function addProduct() {
-      const n = document.getElementById('pr-name').value.trim(), p = Number(document.getElementById('pr-price').value);
-      if (!n || !(p >= 0) || document.getElementById('pr-price').value === '') { notify('商品名と価格を入れてください。'); return; }
-      state.products.push({ id: Date.now(), name: n, price: p });
-      cloud.set('rhp_products_nocoup', JSON.stringify(state.products));
-      document.getElementById('pr-name').value = ''; document.getElementById('pr-price').value = ''; renderAcct();
+      const n = document.getElementById('pr-name').value.trim(), pv = document.getElementById('pr-price').value, p = Number(pv), g = document.getElementById('pr-genre').value;
+      if (!n || pv === '' || !(p >= 0)) { notify('商品名と価格を入れてください。'); return; }
+      state.products.push({ id: Date.now(), name: n, price: p, genre: g });
+      saveProducts();
+      document.getElementById('pr-name').value = ''; document.getElementById('pr-price').value = '';
+      renderAcct(); document.getElementById('pr-name').focus();
     }
-    function delProduct(id) { state.products = state.products.filter(p => p.id !== id); cloud.set('rhp_products_nocoup', JSON.stringify(state.products)); renderAcct(); }
-    function addCartMenu() {
-      const n = document.getElementById('ac-menu').value.trim(), v = document.getElementById('ac-price').value;
-      if (!n || v === '') { notify('メニュー名と金額を入れてください。'); return; }
-      cart.push({ n, p: Number(v), q: 1 });
-      document.getElementById('ac-menu').value = ''; document.getElementById('ac-price').value = ''; renderCart();
+    function delProduct(id) { state.products = state.products.filter(p => p.id !== id); saveProducts(); renderAcct(); }
+    function addProdGenre() {
+      const el = document.getElementById('pg-new'), n = el.value.trim();
+      if (!n) { notify('ジャンル名を入れてください。'); return; }
+      if (badName(n)) { notify('ジャンル名に使えない記号（引用符・バックスラッシュ・< >）が入っています。'); return; }
+      if (state.prodGenres.includes(n)) { notify('同じ名前のジャンルがあります。'); return; }
+      state.prodGenres.splice(state.prodGenres.length - 1, 0, n);
+      el.value = ''; saveProdGenres(); renderAcct();
     }
-    function addCartProduct() {
-      const p = state.products.find(x => String(x.id) === document.getElementById('ac-prod').value);
-      if (!p) { notify('商品を選んでください。'); return; }
-      cart.push({ n: p.name, p: p.price, q: Math.max(1, Number(document.getElementById('ac-qty').value) || 1) }); renderCart();
+    async function delProdGenre(i) {
+      const g = state.prodGenres[i];
+      const n = state.products.filter(p => p.genre === g).length;
+      if (!(await askDialog({ title: '「' + g + '」を削除しますか？', message: n ? 'このジャンルの商品' + n + '件は「その他」に移ります。' : '', ok: '削除する' }))) return;
+      state.products.forEach(p => { if (p.genre === g) p.genre = 'その他'; });
+      state.prodGenres.splice(i, 1);
+      saveProdGenres(); saveProducts(); renderAcct();
     }
-    function cartTotal(a) { return a.reduce((t, x) => t + x.p * x.q, 0); }
-    function renderCart() {
-      const el = document.getElementById('ac-cart'); if (!el) return;
-      el.innerHTML = cart.map((x, i) => `<div class="flex justify-between items-center text-xs p-2 border rounded-xl bg-gray-50"><span>${esc(x.n)} ${yen(x.p)} × ${x.q}</span><button type="button" onclick="cart.splice(${i},1);renderCart()" class="text-red-500 cursor-pointer">削除</button></div>`).join('') + (cart.length ? `<div class="text-right font-bold text-gray-800">合計 ${yen(cartTotal(cart))}</div>` : '');
+
+    // ---- 会計画面（予約のお名前をタップで開く） ----
+    let co = null;
+    const cartTotal = a => a.reduce((t, x) => t + x.p * x.q, 0);
+    function openCheckout(resId) {
+      const r = resId != null ? state.reservations.find(x => x.id === resId) : null;
+      if (resId != null && !r) { notify('予約が見つかりません。'); return; }
+      const v = r ? visitFor(r.id) : null;
+      co = { resId: r ? r.id : null, visitId: v ? v.id : null, fixed: !!r, name: r ? r.name : '', phone: r ? (r.phone || '') : '', date: r ? r.date : ymd(new Date()), cart: v ? v.items.map(x => ({ ...x })) : [], tab: 'tech', genre: null };
+      if (r && !v) String(r.menu || '').split(' / ').forEach(nm => { const m = allMenus.find(x => x.name === nm.trim()); if (m) co.cart.push({ n: m.name, p: m.price, q: 1 }); });
+      const old = document.getElementById('co-overlay'); if (old) old.remove();
+      const w = document.createElement('div');
+      w.id = 'co-overlay';
+      w.style.cssText = 'position:fixed;inset:0;z-index:9998;background:#fff;display:flex;flex-direction:column;overflow:hidden';
+      w.innerHTML = '<div id="co-root" style="display:flex;flex-direction:column;height:100%"></div>';
+      document.body.appendChild(w);
+      renderCheckout();
     }
-    function saveVisit() {
-      const name = document.getElementById('ac-name').value.trim(), date = document.getElementById('ac-date').value;
-      if (!name || !date || !cart.length) { notify('日付・お名前・メニューか商品を入れてください。'); return; }
-      state.visits.push({ id: Date.now(), date, name, phone: document.getElementById('ac-phone').value.trim(), items: cart, total: cartTotal(cart) });
+    function coClose() { const w = document.getElementById('co-overlay'); if (w) w.remove(); co = null; }
+    function coTab(k) { co.tab = k; co.genre = null; renderCheckout(); }
+    function coAdd(tab, id) {
+      const x = tab === 'tech' ? allMenus.find(m => m.id === id) : state.products.find(p => p.id === id);
+      if (!x) return;
+      const hit = co.cart.find(c => c.n === x.name && c.p === x.price);
+      if (hit) hit.q += 1; else co.cart.push({ n: x.name, p: x.price, q: 1 });
+      renderCheckout();
+    }
+    function coAddFree() {
+      const n = document.getElementById('co-dn').value.trim(), pv = document.getElementById('co-dp').value;
+      if (!n || pv === '' || isNaN(Number(pv))) { notify('項目名と金額を入れてください。割引はマイナスの金額（例 -500）です。'); return; }
+      co.cart.push({ n, p: Number(pv), q: 1 }); renderCheckout();
+    }
+    function coQty(i, d) {
+      const x = co.cart[i]; if (!x) return;
+      x.q += d; if (x.q < 1) co.cart.splice(i, 1);
+      renderCheckout();
+    }
+    function renderCheckout() {
+      const root = document.getElementById('co-root'); if (!root || !co) return;
+      const genres = co.tab === 'tech' ? menuGenres : co.tab === 'shop' ? state.prodGenres : [];
+      const itemsOf = g => co.tab === 'tech' ? allMenus.filter(m => m.category === g) : state.products.filter(p => p.genre === g);
+      if (genres.length && (co.genre == null || co.genre >= genres.length)) { const f = genres.findIndex(g => itemsOf(g).length); co.genre = f < 0 ? 0 : f; }
+      const total = cartTotal(co.cart);
+      const inp = 'w-full p-2.5 border rounded-xl bg-gray-50 text-sm';
+      const head = co.fixed
+        ? `<div class="min-w-0"><div class="font-bold text-base break-words">${esc(co.name)} 様</div><div class="text-[11px] text-gray-500">${esc(co.date)}${co.phone ? ' ／ ' + esc(co.phone) : ''}${co.visitId ? ' ／ 会計済（内容を直せます）' : ''}</div></div>`
+        : `<div class="flex-1 space-y-2"><div class="grid grid-cols-2 gap-2"><input type="text" value="${esc(co.name)}" oninput="co.name=this.value" placeholder="お名前" class="${inp}"><input type="date" value="${esc(co.date)}" oninput="co.date=this.value" class="${inp}"></div><input type="tel" value="${esc(co.phone)}" oninput="co.phone=this.value" placeholder="お電話番号（任意）" class="${inp}"></div>`;
+      const cartH = co.cart.map((x, i) => `<div class="flex items-center gap-2 text-xs py-1.5 border-b"><span class="flex-1 min-w-0 break-words font-bold">${esc(x.n)}</span><span class="text-gray-500 shrink-0">${yen(x.p)}</span><button type="button" onclick="coQty(${i},-1)" class="w-7 h-7 rounded-lg bg-gray-100 font-bold cursor-pointer">−</button><span class="w-5 text-center font-bold">${x.q}</span><button type="button" onclick="coQty(${i},1)" class="w-7 h-7 rounded-lg bg-gray-100 font-bold cursor-pointer">＋</button></div>`).join('') || '<p class="text-xs text-gray-400 py-2">下のメニュー・商品をタップして追加します。</p>';
+      const tab = (k, l) => `<button type="button" onclick="coTab('${k}')" class="flex-1 py-2.5 rounded-xl text-xs font-bold cursor-pointer ${co.tab === k ? 'bg-slate-900 text-white' : 'bg-gray-100 text-gray-600'}">${l}</button>`;
+      let mid;
+      if (co.tab === 'disc') {
+        mid = `<div class="p-3 space-y-2"><p class="text-xs text-gray-500">割引・サービスなど自由な項目です。割引はマイナスの金額（例 -500）で入れます。</p><input type="text" id="co-dn" placeholder="項目名（例：ご紹介割引）" class="${inp}"><input type="number" id="co-dp" placeholder="金額（割引は -500）" class="${inp}"><button type="button" onclick="coAddFree()" class="w-full py-2.5 bg-amber-500 text-slate-900 font-bold rounded-xl text-xs cursor-pointer">＋ 会計に追加</button></div>`;
+      } else {
+        const chips = genres.map((g, i) => `<button type="button" onclick="co.genre=${i};renderCheckout()" class="px-3 py-1.5 rounded-lg text-xs font-bold cursor-pointer ${i === co.genre ? 'bg-amber-500 text-slate-900' : (itemsOf(g).length ? 'bg-gray-100 text-gray-700' : 'bg-gray-50 text-gray-300')}">${esc(g)}</button>`).join('');
+        const list = itemsOf(genres[co.genre]).map(x => `<button type="button" onclick="coAdd('${co.tab}',${x.id})" class="w-full flex items-center gap-2 text-left p-3 border rounded-xl bg-white cursor-pointer"><span class="w-6 h-6 rounded-full bg-blue-600 text-white flex items-center justify-center font-bold shrink-0">＋</span><span class="flex-1 min-w-0 text-xs font-bold break-words">${esc(x.name)}</span><span class="text-xs text-emerald-700 font-bold shrink-0">${yen(x.price)}</span></button>`).join('') || '<p class="text-xs text-gray-400 p-1">このジャンルには項目がありません。</p>';
+        mid = `<div class="flex flex-wrap gap-1.5 p-3 pb-1">${chips}</div><div class="p-3 space-y-1.5">${list}</div>`;
+      }
+      root.innerHTML = `<div class="flex items-start justify-between gap-2 p-3 border-b bg-gray-50" style="padding-top:max(12px,env(safe-area-inset-top))">${head}<button type="button" onclick="coClose()" class="shrink-0 px-3 py-2 bg-gray-200 text-gray-700 font-bold rounded-xl text-xs cursor-pointer">閉じる</button></div>
+        <div class="px-3 pt-2" style="max-height:32%;overflow-y:auto">${cartH}</div>
+        <div class="px-3 py-2 text-right font-bold text-gray-800 border-b">合計 ${yen(total)}</div>
+        <div class="flex gap-2 p-3 pb-1">${tab('tech', '技術')}${tab('shop', '店販')}${tab('disc', '割引・その他')}</div>
+        <div style="flex:1;overflow-y:auto">${mid}</div>
+        <div class="p-3 border-t bg-white" style="padding-bottom:max(12px,env(safe-area-inset-bottom))"><button type="button" onclick="coSave()" class="w-full py-3 bg-slate-900 text-white font-bold rounded-xl text-sm cursor-pointer">${co.visitId ? '会計を更新して保存' : '来店済みで保存'}（${yen(total)}）</button></div>`;
+    }
+    function coSave() {
+      const name = (co.name || '').trim();
+      if (!name || !co.date || !co.cart.length) { notify('お名前・日付と、メニューか商品を1つ以上入れてください。'); return; }
+      const rec = { id: co.visitId || Date.now(), date: co.date, name, phone: (co.phone || '').trim(), items: co.cart.map(x => ({ n: x.n, p: x.p, q: x.q })), total: cartTotal(co.cart), resId: co.resId };
+      const i = state.visits.findIndex(v => v.id === rec.id);
+      if (i >= 0) state.visits[i] = rec; else state.visits.push(rec);
       cloud.set('rhp_visits_nocoup', JSON.stringify(state.visits));
-      cart = []; renderAcct(); showToast('保存完了', name + '様の来店を記録しました！');
+      coClose(); renderAcct(); renderAdminCalendar();
+      showToast('保存完了', name + '様の会計を保存しました！');
     }
     async function delVisit(id) {
       if (!(await askDialog({ title: 'この来店記録を削除しますか？', ok: '削除する' }))) return;
-      state.visits = state.visits.filter(v => v.id !== id); cloud.set('rhp_visits_nocoup', JSON.stringify(state.visits)); renderVisits();
+      state.visits = state.visits.filter(v => v.id !== id); cloud.set('rhp_visits_nocoup', JSON.stringify(state.visits)); renderVisits(); renderAdminCalendar();
     }
     function renderVisits() {
       const el = document.getElementById('vs-list'); if (!el) return;
@@ -2521,7 +2642,7 @@
     const auth = getAuth(app);
     const col = n => collection(db, n);
     const cloud = window.cloud;
-    const adminKeys = ['rhp_kartes_nocoup', 'rhp_products_nocoup', 'rhp_visits_nocoup'];
+    const adminKeys = ['rhp_kartes_nocoup', 'rhp_products_nocoup', 'rhp_visits_nocoup', 'rhp_prodgenres_nocoup'];
     cloud.save = (key, val) => setDoc(doc(col(adminKeys.includes(key) ? 'admin' : 'appdata'), key), { value: val, updatedAt: Date.now() });
 
     cloud.login = pw => signInWithEmailAndPassword(auth, ADMIN_EMAIL, pw);
@@ -2588,7 +2709,7 @@
       cloud.setReservations([]);
       cloud.setBlockMemos({});
       delete cloud.cache['rhp_kartes_nocoup'];
-      delete cloud.cache['rhp_products_nocoup']; delete cloud.cache['rhp_visits_nocoup'];
+      delete cloud.cache['rhp_products_nocoup']; delete cloud.cache['rhp_visits_nocoup']; delete cloud.cache['rhp_prodgenres_nocoup'];
       window.refreshApp();
     };
 
