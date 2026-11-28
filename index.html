@@ -610,6 +610,7 @@
           <div class="p-4 bg-amber-50 rounded-2xl border border-amber-200 mb-4 text-xs">
             <div class="font-bold text-gray-700 mb-1">選択中のご予約内容</div>
             <div id="display-selected-summary" class="text-amber-700 font-bold text-sm">日時未選択</div>
+            <div id="over-notice" class="hidden mt-2 p-2 bg-white border border-amber-300 rounded-xl text-[11px] text-amber-800 font-bold"></div>
             <button type="button" onclick="openCalendarModal()" class="mt-2 text-xs text-amber-600 underline font-bold block cursor-pointer">日時を変更する</button>
           </div>
 
@@ -623,7 +624,7 @@
           </div>
           <div>
             <label class="block text-xs font-bold text-gray-700 mb-1">メールアドレス</label>
-            <input type="email" id="book-email" required="" placeholder="example@email.com" class="w-full p-3 border rounded-xl text-sm bg-gray-50">
+            <input type="text" inputmode="email" autocomplete="email" autocapitalize="none" autocorrect="off" spellcheck="false" id="book-email" required="" placeholder="example@email.com" onblur="this.value = cleanEmail(this.value)" class="w-full p-3 border rounded-xl text-sm bg-gray-50">
           </div>
           <div>
             <label class="block text-xs font-bold text-gray-700 mb-1">ご要望・備考（任意）</label>
@@ -827,7 +828,8 @@
               <input type="number" id="pr-price" placeholder="価格" class="w-full p-2.5 border rounded-xl bg-gray-50">
             </div>
           </div>
-          <button type="button" onclick="addProduct()" class="w-full py-2.5 bg-amber-500 hover:bg-amber-600 text-slate-900 font-bold rounded-xl shadow transition cursor-pointer mb-4">＋ 商品を登録</button>
+          <button type="button" onclick="addProduct()" class="w-full py-2.5 bg-amber-500 hover:bg-amber-600 text-slate-900 font-bold rounded-xl shadow transition cursor-pointer mb-2">＋ 商品を登録</button>
+          <button type="button" onclick="seedProducts()" class="w-full py-2.5 bg-slate-800 hover:bg-slate-700 text-white font-bold rounded-xl shadow transition cursor-pointer mb-4 text-xs">初期の店販66品をまとめて登録（登録済みは飛ばします）</button>
           <div class="text-xs font-bold text-gray-600 mb-2">商品のジャンル（追加・削除できます）</div>
           <div id="pg-admin" class="flex flex-wrap gap-1.5 mb-2 text-xs"></div>
           <div class="flex gap-2 mb-4 text-xs">
@@ -880,7 +882,7 @@
         <!-- 予約の受付ルール -->
         <div class="bg-white rounded-3xl p-5 shadow-sm border">
           <h3 class="font-bold text-gray-800 mb-3 flex items-center gap-2">
-            <i class="fa-solid fa-sliders text-amber-600"></i> 予約の受付ルール <span class="text-[10px] font-normal text-gray-400">（版 11/28-c）</span>
+            <i class="fa-solid fa-sliders text-amber-600"></i> 予約の受付ルール <span class="text-[10px] font-normal text-gray-400">（版 11/28-d）</span>
           </h3>
           <form onsubmit="saveBookingSettings(event)" class="space-y-3 text-xs">
             <div>
@@ -893,6 +895,15 @@
               <div class="flex flex-col justify-end"><label class="block font-bold text-gray-700 mb-1" style="min-height:2.6em">取消は何日前まで</label><input type="number" id="set-cancel" min="0" max="30" class="w-full p-2.5 border rounded-xl bg-gray-50"></div>
             </div>
             <p class="text-gray-500">例：「何日先まで」を120にすると約4か月先まで受付します。0日後＝当日の予約も可、1日後＝明日から。</p>
+            <div class="p-3 border rounded-xl bg-gray-50 space-y-2">
+              <label class="flex items-center gap-2 font-bold text-gray-700"><input type="checkbox" id="set-laston" class="w-4 h-4"> 閉店時刻と「メニューごとの最終予約時刻」を使う</label>
+              <div class="grid grid-cols-2 gap-2">
+                <div><label class="block font-bold text-gray-700 mb-1">閉店時刻</label><input type="text" id="set-close" placeholder="20:00" class="w-full p-2.5 border rounded-xl bg-white"></div>
+              </div>
+              <p class="text-gray-500">オンにすると、施術が閉店時刻までに終わる開始時刻だけを出します（例：閉店20:00、所要3時間なら17:00が最終）。メニューの編集で「最終予約時刻」を入れたメニューだけ、それより遅い開始も受け付けます。オフなら今までどおりです。時間を個別に変えた日は対象外です。</p>
+              <label class="flex items-center gap-2 font-bold text-gray-700"><input type="checkbox" id="set-noticeon" class="w-4 h-4"> 閉店を過ぎる予約のとき、お客様に案内を出す</label>
+              <textarea id="set-noticetext" rows="2" maxlength="200" class="w-full p-2.5 border rounded-xl bg-white"></textarea>
+            </div>
             <button type="submit" class="w-full py-2.5 bg-amber-500 hover:bg-amber-600 text-slate-900 font-bold rounded-xl shadow cursor-pointer">受付ルールを保存</button>
           </form>
         </div>
@@ -960,6 +971,10 @@
                 <label class="block font-bold text-gray-600 mb-1">所要時間 (分)</label>
                 <input type="number" id="menu-form-time" required="" placeholder="60" class="w-full p-2.5 border rounded-xl bg-gray-50">
               </div>
+            </div>
+            <div>
+              <label class="block font-bold text-gray-600 mb-1">最終予約時刻（任意・開始時刻）</label>
+              <input type="text" id="menu-form-last" placeholder="例: 19:30（空欄なら通常どおり）" class="w-full p-2.5 border rounded-xl bg-gray-50">
             </div>
             <div>
               <label class="block font-bold text-gray-600 mb-1">説明文</label>
@@ -1502,7 +1517,7 @@
     const DEFAULT_MENU_GENRES = ["カット", "カラー", "パーマ", "縮毛矯正", "トリートメント", "スパ・その他"];
     let menuGenres = [...DEFAULT_MENU_GENRES];
     let categories = ["すべて", ...menuGenres];
-    const DEFAULT_BOOKING = { timeSlots: Array.from({ length: 20 }, (_, i) => { const m = 570 + i * 30; return String(Math.floor(m / 60)).padStart(2, '0') + ':' + String(m % 60).padStart(2, '0'); }), minDays: 1, maxDays: 120, cancelDays: 1 };
+    const DEFAULT_BOOKING = { timeSlots: Array.from({ length: 20 }, (_, i) => { const m = 570 + i * 30; return String(Math.floor(m / 60)).padStart(2, '0') + ':' + String(m % 60).padStart(2, '0'); }), minDays: 1, maxDays: 120, cancelDays: 1, closeTime: '20:00', lastOn: false, noticeOn: true, noticeText: 'こちらの時間は通常の営業時間を過ぎてのご案内になります。ご了承のうえご予約ください。' };
     let timeSlots = [...DEFAULT_BOOKING.timeSlots];
 
     let allMenus = [];
@@ -1726,6 +1741,9 @@
       const b = state.booking;
       const set = (id, v) => { const el = document.getElementById(id); if (el) el.value = v; };
       set('set-times', b.timeSlots.join(', ')); set('set-min', b.minDays); set('set-max', b.maxDays); set('set-cancel', b.cancelDays);
+      set('set-close', b.closeTime || '20:00'); set('set-noticetext', b.noticeText || '');
+      const ck = (id, v) => { const el = document.getElementById(id); if (el) el.checked = !!v; };
+      ck('set-laston', b.lastOn); ck('set-noticeon', b.noticeOn);
     }
     function saveBookingSettings(e) {
       e.preventDefault();
@@ -1735,7 +1753,11 @@
       }))].sort();
       if (!times.length || times.includes(null)) { notify('時間は「09:30, 11:00」のように、半角で入力してください。'); return; }
       const n = (id, lo, hi) => Math.min(hi, Math.max(lo, parseInt(document.getElementById(id).value, 10) || 0));
-      state.booking = { timeSlots: times, minDays: n('set-min', 0, 60), maxDays: n('set-max', 1, 400), cancelDays: n('set-cancel', 0, 30) };
+      const cm = document.getElementById('set-close').value.trim().normalize('NFKC').match(/^(\d{1,2}):(\d{2})$/);
+      if (!cm || +cm[1] > 24 || +cm[2] > 59) { notify('閉店時刻は「20:00」のように、半角で入力してください。'); return; }
+      state.booking = { timeSlots: times, minDays: n('set-min', 0, 60), maxDays: n('set-max', 1, 400), cancelDays: n('set-cancel', 0, 30),
+        closeTime: String(+cm[1]).padStart(2, '0') + ':' + cm[2], lastOn: document.getElementById('set-laston').checked,
+        noticeOn: document.getElementById('set-noticeon').checked, noticeText: document.getElementById('set-noticetext').value.trim().slice(0, 200) };
       timeSlots = times;
       cloud.set('rhp_booking_settings_nocoup', JSON.stringify(state.booking));
       applyBookingSettings(); renderAdminCalendar();
@@ -1777,7 +1799,10 @@
 
       const timeContainer = document.getElementById('time-slots-list');
       const dur = selectedDuration();
-      timeContainer.innerHTML = dayTimes(dateStr).map(t => !isSlotFree(dateStr, t, dur) ? `
+      const opts = startOptions(dateStr, dur), b = state.booking;
+      const noteHtml = (opts.some(o => o.over) && b.noticeOn && b.noticeText) ? `<div class="col-span-3 p-2.5 bg-amber-50 border border-amber-200 rounded-xl text-[11px] text-amber-800 font-bold">${esc(b.noticeText)}</div>` : '';
+      const emptyHtml = opts.length ? '' : '<div class="col-span-3 text-xs text-gray-500 p-2">この日にご案内できる開始時間がありません。別の日をお選びください。</div>';
+      timeContainer.innerHTML = noteHtml + emptyHtml + opts.map(o => o.t).map(t => !isSlotFree(dateStr, t, dur) ? `
         <div class="p-3 bg-gray-200 text-gray-400 font-bold rounded-xl text-center">${t} 〜<div class="text-[10px]">予約不可</div></div>
       ` : `
         <button type="button" onclick="selectTime('${t}')" class="p-3 bg-slate-900 text-amber-400 font-bold rounded-xl text-center hover:bg-slate-800 cursor-pointer shadow">
@@ -1795,6 +1820,9 @@
       closeTimeModal();
       const selectedNames = allMenus.filter(m => state.selectedMenuIds.includes(m.id)).map(m => m.name).join(' / ');
       document.getElementById('display-selected-summary').innerText = `${state.selectedDate} ${state.selectedTime}〜 (${selectedNames})`;
+      const on = document.getElementById('over-notice'), bk = state.booking;
+      const isOver = bk.lastOn && !state.dayHours[state.selectedDate] && slotMin(timeStr) + selectedDuration() > closeMin();
+      on.textContent = (isOver && bk.noticeOn) ? bk.noticeText : ''; on.classList.toggle('hidden', !(isOver && bk.noticeOn && bk.noticeText));
       document.getElementById('booking-step4-container').classList.remove('hidden');
       document.getElementById('booking-step4-container').scrollIntoView({ behavior: 'smooth' });
     }
@@ -1803,7 +1831,25 @@
     const slotKey = (d, t) => d + '_' + t.replace(':', '');
     function selectedDuration() { return allMenus.filter(m => state.selectedMenuIds.includes(m.id)).reduce((s, m) => s + (Number(m.time) || 0), 0) || 30; }
     function coveredTimes(t, dur) { const s = slotMin(t); return [...new Set([...timeSlots, ...grid30()])].filter(x => { const m = slotMin(x); return m >= s && m < s + dur; }).sort(); }
+    const closeMin = () => { const m = String(state.booking.closeTime || '20:00').match(/^(\d{1,2}):(\d{2})$/); return m ? +m[1] * 60 + +m[2] : 1200; };
+    function overrideLast() {
+      const ms = allMenus.filter(m => state.selectedMenuIds.includes(m.id));
+      if (!ms.length || !ms.every(m => m.last)) return null;
+      return Math.min(...ms.map(m => slotMin(m.last)));
+    }
+    // 予約できる開始時刻（over = 閉店を過ぎる開始）。オフ・時間変更日は従来どおり
+    function startOptions(date, dur) {
+      const base = dayTimes(date);
+      if (!state.booking.lastOn || state.dayHours[date]) return base.map(t => ({ t, over: false }));
+      const close = closeMin(), ov = overrideLast();
+      const limit = Math.max(close - dur, ov == null ? -1 : ov);
+      const set = new Set(base), lastBase = slotMin(base[base.length - 1]);
+      if (ov != null) grid30().forEach(t => { const m = slotMin(t); if (m > lastBase && m <= ov) set.add(t); });
+      return [...set].sort().filter(t => slotMin(t) <= limit).map(t => ({ t, over: slotMin(t) + dur > close }));
+    }
     function isSlotFree(date, t, dur) { return coveredTimes(t, dur).every(x => !state.slots[slotKey(date, x)]); }
+    // メールの空白（半角・全角・改行）を消し、全角英数字・＠を半角にそろえる
+    function cleanEmail(v) { return String(v || '').normalize('NFKC').replace(/[\s\u3000]+/g, ''); }
     function newCode() { const a = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; let s = ''; const r = crypto.getRandomValues(new Uint8Array(12)); r.forEach(v => { s += a[v % a.length]; }); return s; }
     const fmtCode = c => c.replace(/(.{4})(?=.)/g, '$1-');
 
@@ -1811,9 +1857,11 @@
       e.preventDefault();
       const name = document.getElementById('book-name').value;
       const phone = document.getElementById('book-phone').value;
-      const email = document.getElementById('book-email').value;
+      const email = cleanEmail(document.getElementById('book-email').value);
+      document.getElementById('book-email').value = email;
+      if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) { notify('メールアドレスの形式を確認してください。（例：example@email.com）'); return; }
       const dur = selectedDuration();
-      if (!isSlotFree(state.selectedDate, state.selectedTime, dur)) {
+      if (!startOptions(state.selectedDate, dur).some(o => o.t === state.selectedTime) || !isSlotFree(state.selectedDate, state.selectedTime, dur)) {
         showToast('⚠️ 予約不可', 'その時間はすでにご予約が入っています。別の時間をお選びください。');
         return;
       }
@@ -1919,7 +1967,7 @@
           <div class="min-w-0 flex-1 break-words">
             <span class="font-bold text-amber-600 font-mono">[${m.category}]</span> 
             <strong class="text-gray-800 ml-1">${m.name}</strong> 
-            <span class="text-gray-500">(${m.time}分)</span>
+            <span class="text-gray-500">(${m.time}分)</span>${m.last ? `<span class="ml-1 px-1.5 py-0.5 rounded bg-slate-800 text-white text-[10px] font-bold">最終${esc(m.last)}</span>` : ''}
             <div class="text-emerald-700 font-bold mt-0.5">¥${m.price.toLocaleString()}</div>
           </div>
           <div class="flex gap-1 shrink-0">
@@ -1938,6 +1986,13 @@
       const price = parseInt(document.getElementById('menu-form-price').value);
       const time = parseInt(document.getElementById('menu-form-time').value);
       const desc = document.getElementById('menu-form-desc').value;
+      const lm = document.getElementById('menu-form-last').value.trim().normalize('NFKC');
+      let last = '';
+      if (lm) {
+        const mm = lm.match(/^(\d{1,2}):(\d{2})$/);
+        if (!mm || +mm[1] > 24 || +mm[2] > 59) { notify('最終予約時刻は「19:30」のように、半角で入力してください。'); return; }
+        last = String(+mm[1]).padStart(2, '0') + ':' + mm[2];
+      }
 
       if (idVal) {
         const target = allMenus.find(m => m.id === parseInt(idVal));
@@ -1947,9 +2002,10 @@
           target.price = price;
           target.time = time;
           target.desc = desc;
+          target.last = last;
         }
       } else {
-        allMenus.push({ id: Date.now(), category: cat, name, price, time, desc });
+        allMenus.push({ id: Date.now(), category: cat, name, price, time, desc, last });
       }
 
       cloud.set('rhp_custom_menus_nocoup', JSON.stringify(allMenus));
@@ -1968,6 +2024,7 @@
       document.getElementById('menu-form-price').value = m.price;
       document.getElementById('menu-form-time').value = m.time;
       document.getElementById('menu-form-desc').value = m.desc || '';
+      document.getElementById('menu-form-last').value = m.last || '';
       document.getElementById('menu-form-submit-btn').innerText = "✓ メニューを更新する";
       document.getElementById('menu-form-cancel-btn').classList.remove('hidden');
     }
@@ -1978,6 +2035,7 @@
       document.getElementById('menu-form-price').value = '';
       document.getElementById('menu-form-time').value = '';
       document.getElementById('menu-form-desc').value = '';
+      document.getElementById('menu-form-last').value = '';
       document.getElementById('menu-form-submit-btn').innerText = "＋ メニューを追加する";
       document.getElementById('menu-form-cancel-btn').classList.add('hidden');
     }
@@ -2505,6 +2563,19 @@
       saveProducts();
       document.getElementById('pr-name').value = ''; document.getElementById('pr-price').value = '';
       renderAcct(); document.getElementById('pr-name').focus();
+    }
+    const SEED_PRODUCTS = [["シャンプー", "ノディア ティントシャンプー 紫色", 2420], ["シャンプー", "イーラル スカルプシャンプー", 4400], ["シャンプー", "コタ 5sh 750ml", 6050], ["シャンプー", "ネイチャーディープ リペア", 2420], ["シャンプー", "コタ クチュール フランネル 詰め替え", 6820], ["シャンプー", "コタセラ sh 800ml", 6600], ["シャンプー", "艶髪 リペア 1000ml", 4840], ["シャンプー", "コタ 5sh 300ml", 3080], ["シャンプー", "コタ クチュール 600", 7700], ["シャンプー", "コタ 7sh 300ml", 3080], ["シャンプー", "コタ 9sh 300ml", 3080], ["シャンプー", "コタセラ sh 300ml", 3080], ["シャンプー", "コタ 7sh 750ml", 6050], ["シャンプー", "コタ 9sh 750ml", 6050], ["シャンプー", "コタセラ sh 750ml", 6050], ["シャンプー", "コタ 5sh 800ml", 6600], ["シャンプー", "コタ 7sh 800ml", 6600], ["シャンプー", "コタ 9sh 800ml", 6600], ["シャンプー", "コタクチュール ベルベット sh 550ml 詰め", 6820], ["シャンプー", "コタ3sh750", 6050], ["シャンプー", "クチュール フランネル 300ml", 4290], ["ヘアパック・トリートメント", "リンケージ", 660], ["ヘアパック・トリートメント", "イーラル ハニーパック", 2420], ["ヘアパック・トリートメント", "コタセラTR 200g", 3410], ["ヘアパック・トリートメント", "コタセラ tr 750g", 7920], ["ヘアパック・トリートメント", "トリートメントkpx", 1430], ["ヘアパック・トリートメント", "コタ tr 800g", 8470], ["ヘアパック・トリートメント", "ネイチャーディープ リペア", 2420], ["ヘアパック・トリートメント", "艶髪 リペア 1000g", 7260], ["ヘアパック・トリートメント", "コタtr200(新)", 3410], ["ヘアパック・トリートメント", "コタ クチュール 600", 9900], ["ヘアパック・トリートメント", "コタ 5TR 200g", 3410], ["ヘアパック・トリートメント", "コタ 7TR 200g", 3410], ["ヘアパック・トリートメント", "コタ 9TR 200g", 3410], ["ヘアパック・トリートメント", "コタ 5tr 750g", 7920], ["ヘアパック・トリートメント", "コタ 7tr 750g", 7920], ["ヘアパック・トリートメント", "コタ 9tr 750g", 7920], ["ヘアパック・トリートメント", "コタ 5tr 800g", 8470], ["ヘアパック・トリートメント", "コタ 7tr 800g", 8470], ["ヘアパック・トリートメント", "コタ 9tr 800g", 8470], ["ヘアパック・トリートメント", "コタクチュール ベルベット tr 550g 詰め", 9020], ["ヘアパック・トリートメント", "コタ3tr750", 7920], ["アウトバストリートメント", "エルジューダ サントリートメント エマルジョン", 3080], ["アウトバストリートメント", "エルジューダ サントリートメント オイル", 3080], ["アウトバストリートメント", "bb1", 3630], ["アウトバストリートメント", "艶髪エッセンスミスト", 2640], ["アウトバストリートメント", "ネイチャーディープ ミルク", 2200], ["アウトバストリートメント", "ネイチャーディープ オイル", 2200], ["アウトバストリートメント", "エルジューダ サンプロテクト", 3380], ["アウトバストリートメント", "リケラエマルジョン 80g", 2970], ["アウトバストリートメント", "リケラエマルジョン 200g", 4620], ["アウトバストリートメント", "リケラミスト 200ml", 3740], ["アウトバストリートメント", "リケラオイル", 5280], ["頭皮ケア", "ネイチャーディープ スカルプ", 3300], ["ヘアスプレー・ヘアミスト", "インプライム アートスプレー 180g", 1650], ["ヘアスプレー・ヘアミスト", "ミーファ uv ホワイトティー", 1320], ["ヘアワックス・クリーム", "プリズナー12", 2200], ["ヘアワックス・クリーム", "エトラス グリックス 100g", 2310], ["ヘアワックス・クリーム", "エトラス セミドライクリーム 80g", 2310], ["ヘアワックス・クリーム", "アリミノWハード", 1100], ["その他スタイリング", "トラックオイル", 4180], ["その他スタイリング", "ナイン スプレー9", 2090], ["その他スタイリング", "プリズナー9", 1980], ["その他スタイリング", "ヒトヨニ11", 1980], ["その他スタイリング", "スタイリングバーム", 2200], ["その他", "バイブルグロスファクター", 7150]];
+    async function seedProducts() {
+      const fresh = SEED_PRODUCTS.filter(x => !state.products.some(p => p.genre === x[0] && p.name === x[1]));
+      if (!fresh.length) { notify('初期の商品はすべて登録済みです。'); return; }
+      if (!(await askDialog({ title: '店販' + fresh.length + '品を登録しますか？', message: '登録済みの商品は飛ばします。あとから削除もできます。', ok: '登録する' }))) return;
+      const t = Date.now();
+      fresh.forEach((x, i) => {
+        if (!state.prodGenres.includes(x[0])) state.prodGenres.splice(state.prodGenres.length - 1, 0, x[0]);
+        state.products.push({ id: t + i, name: x[1], price: x[2], genre: x[0] });
+      });
+      saveProdGenres(); saveProducts(); renderAcct();
+      showToast('✅ 登録完了', fresh.length + '品を登録しました。');
     }
     function delProduct(id) { state.products = state.products.filter(p => p.id !== id); saveProducts(); renderAcct(); }
     function addProdGenre() {
