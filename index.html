@@ -888,7 +888,7 @@
         <!-- 予約の受付ルール -->
         <div class="bg-white rounded-3xl p-5 shadow-sm border">
           <h3 class="font-bold text-gray-800 mb-3 flex items-center gap-2">
-            <i class="fa-solid fa-sliders text-amber-600"></i> 予約の受付ルール <span class="text-[10px] font-normal text-gray-400">（版 11/28-a）</span>
+            <i class="fa-solid fa-sliders text-amber-600"></i> 予約の受付ルール <span class="text-[10px] font-normal text-gray-400">（版 11/28-b）</span>
           </h3>
           <form onsubmit="saveBookingSettings(event)" class="space-y-3 text-xs">
             <div>
@@ -1467,36 +1467,36 @@
       }
     };
     const initialMenus = [
-      { id: 1, category: "カット", name: "カット", price: 5900, time: 60, desc: "カット単品メニュー" },
-      { id: 2, category: "カット", name: "カット＋マイクロバブル＋炭酸スパ", price: 7900, time: 75, desc: "カット＋マイクロバブル＋スパ" },
-      { id: 3, category: "カット", name: "カット＋マイクロバブル＋リンケージトリートメント", price: 8900, time: 75, desc: "カット＋クレンジング＋トリートメントになります" },
+      { id: 1, category: "カット", name: "カット", price: 5900, time: 90, desc: "カット単品メニュー" },
+      { id: 2, category: "カット", name: "カット＋マイクロバブル＋炭酸スパ", price: 7900, time: 90, desc: "カット＋マイクロバブル＋スパ" },
+      { id: 3, category: "カット", name: "カット＋マイクロバブル＋リンケージトリートメント", price: 8900, time: 90, desc: "カット＋クレンジング＋トリートメントになります" },
       { id: 4, category: "カット", name: "カット＋マイクロバブル＋リンケージトリートメント＋炭酸スパ", price: 10400, time: 90, desc: "カット＋クレンジング＋炭酸スパ＋トリートメントになります" },
-      { id: 5, category: "カット", name: "カット＋頭皮ケアコース", price: 8400, time: 75, desc: "カット＋マイクロバブル＋炭酸スパ＋頭皮用トリートメント＆シャンプー" },
+      { id: 5, category: "カット", name: "カット＋頭皮ケアコース", price: 8400, time: 90, desc: "カット＋マイクロバブル＋炭酸スパ＋頭皮用トリートメント＆シャンプー" },
       { id: 6, category: "カット", name: "カット＋リラクゼーションコース", price: 9900, time: 90, desc: "カット＋炭酸スパ＋ツボ押しスパ（クイック）＋マイクロバブル" },
-      { id: 7, category: "カット", name: "前髪カット", price: 1500, time: 15, desc: "前髪のみのポイントカット" },
-      { id: 8, category: "カラー", name: "カラー(SB、マイクロバブル込)", price: 9400, time: 90, desc: "ブリーチ+2000円" },
-      { id: 9, category: "カラー", name: "リタッチカラー(SB、マイクロバブル込み)", price: 8900, time: 75, desc: "根元3cm前後" },
-      { id: 10, category: "カラー", name: "カラー＋炭酸ヘッドスパ＋マイクロバブル", price: 10900, time: 90, desc: "ブリーチを使う場合は+1100円から2200円" },
-      { id: 11, category: "カラー", name: "カラー＋マイクロバブル＋リンケージトリートメント", price: 12400, time: 90, desc: "ブリーチを使う場合は+1100円から2200円" },
-      { id: 12, category: "カラー", name: "カラー＋炭酸ヘッドスパ＋リンケージバブルトリートメント＋マイクロバブル", price: 13900, time: 105, desc: "ブリーチを使う場合は+1100円から2200円" },
-      { id: 13, category: "カラー", name: "リタッチカラー(SB込み) ＋炭酸スパ＋マイクロバブル", price: 9900, time: 75, desc: "リタッチカラー マイクロバブル 炭酸スパになります！およそ3cm目安とさせていただきます！" },
-      { id: 14, category: "カラー", name: "リタッチカラー ＋リンケージトリートメント ＋マイクロバブル", price: 11400, time: 75, desc: "リタッチカラー リンケージトリートメント マイクロバブル 炭酸スパ +660でホームケア" },
-      { id: 15, category: "カラー", name: "カット＋カラー＋炭酸ヘッドスパ＋マイクロバブル", price: 13900, time: 120, desc: "ダブルカラー特殊カラーは除きます +2000円でリンケージ +660円ホームケア" },
-      { id: 16, category: "カラー", name: "カット＋カラー＋リンケージトリートメント＋マイクロバブル", price: 15400, time: 135, desc: "ダブルカラー等は除きます ＋1500円で炭酸ヘッドスパ" },
-      { id: 17, category: "カラー", name: "カット＋カラー＋炭酸ヘッドスパ＋リンケージトリートメント＋マイクロバブル", price: 16900, time: 150, desc: "フルフルコースメニュー" },
-      { id: 18, category: "パーマ", name: "パーマ(SB込)", price: 8900, time: 90, desc: "パーマ単品メニュー" },
-      { id: 19, category: "パーマ", name: "カット＋パーマ＋炭酸ヘッドスパ＋マイクロバブル", price: 13900, time: 120, desc: "特殊パーマは除きます" },
-      { id: 20, category: "パーマ", name: "カット＋パーマ＋リンケージトリートメント＋マイクロバブル", price: 15400, time: 135, desc: "特殊パーマは除きます" },
+      { id: 7, category: "カット", name: "前髪カット", price: 1500, time: 30, desc: "前髪のみのポイントカット" },
+      { id: 8, category: "カラー", name: "カラー(SB、マイクロバブル込)", price: 9400, time: 120, desc: "ブリーチ+2000円" },
+      { id: 9, category: "カラー", name: "リタッチカラー(SB、マイクロバブル込み)", price: 8900, time: 120, desc: "根元3cm前後" },
+      { id: 10, category: "カラー", name: "カラー＋炭酸ヘッドスパ＋マイクロバブル", price: 10900, time: 150, desc: "ブリーチを使う場合は+1100円から2200円" },
+      { id: 11, category: "カラー", name: "カラー＋マイクロバブル＋リンケージトリートメント", price: 12400, time: 150, desc: "ブリーチを使う場合は+1100円から2200円" },
+      { id: 12, category: "カラー", name: "カラー＋炭酸ヘッドスパ＋リンケージバブルトリートメント＋マイクロバブル", price: 13900, time: 150, desc: "ブリーチを使う場合は+1100円から2200円" },
+      { id: 13, category: "カラー", name: "リタッチカラー(SB込み) ＋炭酸スパ＋マイクロバブル", price: 9900, time: 120, desc: "リタッチカラー マイクロバブル 炭酸スパになります！およそ3cm目安とさせていただきます！" },
+      { id: 14, category: "カラー", name: "リタッチカラー ＋リンケージトリートメント ＋マイクロバブル", price: 11400, time: 150, desc: "リタッチカラー リンケージトリートメント マイクロバブル 炭酸スパ +660でホームケア" },
+      { id: 15, category: "カラー", name: "カット＋カラー＋炭酸ヘッドスパ＋マイクロバブル", price: 13900, time: 180, desc: "ダブルカラー特殊カラーは除きます +2000円でリンケージ +660円ホームケア" },
+      { id: 16, category: "カラー", name: "カット＋カラー＋リンケージトリートメント＋マイクロバブル", price: 15400, time: 180, desc: "ダブルカラー等は除きます ＋1500円で炭酸ヘッドスパ" },
+      { id: 17, category: "カラー", name: "カット＋カラー＋炭酸ヘッドスパ＋リンケージトリートメント＋マイクロバブル", price: 16900, time: 180, desc: "フルフルコースメニュー" },
+      { id: 18, category: "パーマ", name: "パーマ(SB込)", price: 8900, time: 120, desc: "パーマ単品メニュー" },
+      { id: 19, category: "パーマ", name: "カット＋パーマ＋炭酸ヘッドスパ＋マイクロバブル", price: 13900, time: 180, desc: "特殊パーマは除きます" },
+      { id: 20, category: "パーマ", name: "カット＋パーマ＋リンケージトリートメント＋マイクロバブル", price: 15400, time: 180, desc: "特殊パーマは除きます" },
       { id: 21, category: "縮毛矯正", name: "前髪縮毛矯正", price: 9900, time: 90, desc: "前髪のみの縮毛矯正" },
-      { id: 22, category: "縮毛矯正", name: "顔周り縮毛矯正", price: 12900, time: 105, desc: "顔周りの縮毛矯正" },
-      { id: 23, category: "縮毛矯正", name: "ハーフ縮毛矯正", price: 14900, time: 120, desc: "範囲が全体の半分くらいの縮毛です" },
-      { id: 24, category: "縮毛矯正", name: "縮毛矯正(SB込)", price: 17900, time: 150, desc: "全頭縮毛矯正" },
-      { id: 25, category: "縮毛矯正", name: "カット＋縮毛矯正＋ヘッドスパ＋マイクロバブル", price: 23900, time: 180, desc: "フルコース縮毛矯正" },
-      { id: 26, category: "縮毛矯正", name: "カット＋縮毛矯正＋リンケージトリートメント＋マイクロバブル", price: 25400, time: 195, desc: "トリートメント付縮毛矯正" },
-      { id: 27, category: "縮毛矯正", name: "カット＋縮毛矯正＋炭酸ヘッドスパ＋トリートメント＋マイクロバブル", price: 26900, time: 210, desc: "プレミアム縮毛矯正コース" },
-      { id: 28, category: "トリートメント", name: "リンケージ トリートメント ※SB別になります", price: 4400, time: 30, desc: "ホームケア付き" },
-      { id: 29, category: "スパ・その他", name: "ヘッドスパ(ツボ押しタイプ)SB込み", price: 6200, time: 45, desc: "ツボ押しスパ" },
-      { id: 30, category: "スパ・その他", name: "シャンプーブロー", price: 3900, time: 30, desc: "シャンプー＆ブロー" }
+      { id: 22, category: "縮毛矯正", name: "顔周り縮毛矯正", price: 12900, time: 120, desc: "顔周りの縮毛矯正" },
+      { id: 23, category: "縮毛矯正", name: "ハーフ縮毛矯正", price: 14900, time: 150, desc: "範囲が全体の半分くらいの縮毛です" },
+      { id: 24, category: "縮毛矯正", name: "縮毛矯正(SB込)", price: 17900, time: 210, desc: "全頭縮毛矯正" },
+      { id: 25, category: "縮毛矯正", name: "カット＋縮毛矯正＋ヘッドスパ＋マイクロバブル", price: 23900, time: 270, desc: "フルコース縮毛矯正" },
+      { id: 26, category: "縮毛矯正", name: "カット＋縮毛矯正＋リンケージトリートメント＋マイクロバブル", price: 25400, time: 270, desc: "トリートメント付縮毛矯正" },
+      { id: 27, category: "縮毛矯正", name: "カット＋縮毛矯正＋炭酸ヘッドスパ＋トリートメント＋マイクロバブル", price: 26900, time: 270, desc: "プレミアム縮毛矯正コース" },
+      { id: 28, category: "トリートメント", name: "リンケージ トリートメント ※SB別になります", price: 4400, time: 20, desc: "ホームケア付き" },
+      { id: 29, category: "スパ・その他", name: "ヘッドスパ(ツボ押しタイプ)SB込み", price: 6200, time: 60, desc: "ツボ押しスパ" },
+      { id: 30, category: "スパ・その他", name: "シャンプーブロー", price: 3900, time: 40, desc: "シャンプー＆ブロー" }
     ];
 
     const categories = ["すべて", "カット", "カラー", "パーマ", "縮毛矯正", "トリートメント", "スパ・その他"];
