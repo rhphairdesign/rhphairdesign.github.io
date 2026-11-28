@@ -882,7 +882,7 @@
         <!-- 予約の受付ルール -->
         <div class="bg-white rounded-3xl p-5 shadow-sm border">
           <h3 class="font-bold text-gray-800 mb-3 flex items-center gap-2">
-            <i class="fa-solid fa-sliders text-amber-600"></i> 予約の受付ルール <span class="text-[10px] font-normal text-gray-400">（版 11/28-d）</span>
+            <i class="fa-solid fa-sliders text-amber-600"></i> 予約の受付ルール <span class="text-[10px] font-normal text-gray-400">（版 11/29-a）</span>
           </h3>
           <form onsubmit="saveBookingSettings(event)" class="space-y-3 text-xs">
             <div>
@@ -2208,7 +2208,8 @@
       h += '</div></div>';
       const dayRes = state.reservations.filter(r => r.date === calSelected);
       const closedNow = isClosedDay(calSelected);
-      const times = [...new Set([...(closedNow ? [] : dayTimes(calSelected)), ...dayRes.map(r => r.time)])].sort();
+      const blockTimes = Object.keys(state.slots).filter(k => k.indexOf(calSelected + '_') === 0 && state.slots[k] === 'BLOCK').map(k => { const x = k.split('_')[1]; return x.slice(0, 2) + ':' + x.slice(2); });
+      const times = [...new Set([...(closedNow ? [] : dayTimes(calSelected)), ...dayRes.map(r => r.time), ...blockTimes])].sort();
       const row = (t, inner, cls) => `<div class="flex gap-2 items-start text-xs p-2.5 rounded-xl border ${cls}"><div class="font-bold w-12 shrink-0 pt-1">${esc(t)}</div>${inner}</div>`;
       const btn = (cls, onclick, label) => `<button type="button" onclick="${onclick}" class="shrink-0 px-2.5 py-1.5 font-bold rounded-lg cursor-pointer ${cls}">${label}</button>`;
       const dctl = closedNow
